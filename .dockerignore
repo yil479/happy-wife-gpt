@@ -1,0 +1,9 @@
+.git
+backend/.venv
+chroma_db
+data
+*.env
+__pycache__
+*.pyc
+*.pyo
+.DS_Store
