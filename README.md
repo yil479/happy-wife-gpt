@@ -27,7 +27,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# fill in ANTHROPIC_API_KEY and OPENAI_API_KEY
+# fill in OPENAI_API_KEY
 ```
 
 ## Run the API
