@@ -11,7 +11,7 @@ A RAG-powered marriage guidance chatbot. The user logs personal argument experie
 | Frontend | React + TypeScript (Vite) | CloudFront + S3 |
 | Backend | Python + FastAPI + uvicorn | ECS Fargate (same Docker image) |
 | RAG framework | LlamaIndex | same |
-| LLM | Anthropic Claude (`claude-sonnet-4-6`) | same |
+| LLM | OpenAI `gpt-4o-mini` | same |
 | Embeddings | OpenAI `text-embedding-3-small` | same |
 | Vector store | ChromaDB (local file) | OpenSearch Serverless |
 | File storage | Local `data/` folder | S3 |

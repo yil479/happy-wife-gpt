@@ -5,18 +5,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file="../.env",
+        env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
 
     # API keys
-    anthropic_api_key: str = ""
     openai_api_key: str = ""
     api_key: str = ""  # X-API-Key header; leave empty to disable auth in local dev
 
     # Model configuration
-    llm_model: str = "claude-sonnet-4-6"
+    llm_model: str = "gpt-4o-mini"
     embedding_model: str = "text-embedding-3-small"
 
     # Storage backend

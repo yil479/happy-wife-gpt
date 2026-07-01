@@ -4,12 +4,15 @@ from llama_index.core import VectorStoreIndex
 from llama_index.core import Settings as LlamaSettings
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.chat_engine import CondensePlusContextChatEngine
-from llama_index.llms.anthropic import Anthropic
+from llama_index.core.llms import ChatMessage, MessageRole
+from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
 
 from backend.config import Settings
 from backend.storage.base import BaseVectorStore
 from backend.rag.prompts import MARRIAGE_COUNSELOR_SYSTEM_PROMPT
+
+_EMPTY = "Empty Response"
 
 
 class RAGEngine:
@@ -19,17 +22,15 @@ class RAGEngine:
         self._store = store
         self._session_memories: dict[str, ChatMemoryBuffer] = {}
 
-        # Configure LlamaIndex global settings once at construction time
-        LlamaSettings.llm = Anthropic(
+        LlamaSettings.llm = OpenAI(
             model=settings.llm_model,
-            api_key=settings.anthropic_api_key,
+            api_key=settings.openai_api_key,
         )
         LlamaSettings.embed_model = OpenAIEmbedding(
             model=settings.embedding_model,
             api_key=settings.openai_api_key,
         )
 
-        # Build a VectorStoreIndex for each collection
         self._indexes: dict[str, VectorStoreIndex] = {
             col: VectorStoreIndex.from_vector_store(
                 vector_store=store.get_store(col)
@@ -49,7 +50,6 @@ class RAGEngine:
         if collection != "both":
             return self._indexes[collection].as_retriever(similarity_top_k=top_k)
 
-        # Merge both collections with QueryFusionRetriever
         from llama_index.core.retrievers import QueryFusionRetriever
         return QueryFusionRetriever(
             retrievers=[
@@ -84,6 +84,21 @@ class RAGEngine:
                 })
         return sources
 
+    def _build_direct_messages(self, session_id: str, message: str) -> list[ChatMessage]:
+        """Build a message list for direct LLM calls (no RAG context)."""
+        memory = self._get_memory(session_id)
+        history = memory.get()
+        return (
+            [ChatMessage(role=MessageRole.SYSTEM, content=MARRIAGE_COUNSELOR_SYSTEM_PROMPT)]
+            + history
+            + [ChatMessage(role=MessageRole.USER, content=message)]
+        )
+
+    def _update_memory(self, session_id: str, user_msg: str, assistant_msg: str) -> None:
+        memory = self._get_memory(session_id)
+        memory.put(ChatMessage(role=MessageRole.USER, content=user_msg))
+        memory.put(ChatMessage(role=MessageRole.ASSISTANT, content=assistant_msg))
+
     async def chat(
         self,
         session_id: str,
@@ -92,10 +107,18 @@ class RAGEngine:
     ) -> dict:
         engine = self._build_chat_engine(session_id, collection)
         response = await engine.achat(message)
-        return {
-            "answer": str(response),
-            "sources": self._extract_sources(response),
-        }
+        answer = str(response)
+
+        # LlamaIndex returns "Empty Response" when the vector store has no documents.
+        # Fall back to a direct LLM call so the counselor still responds.
+        if answer.strip() == _EMPTY:
+            messages = self._build_direct_messages(session_id, message)
+            direct = await LlamaSettings.llm.achat(messages)
+            answer = direct.message.content or ""
+            self._update_memory(session_id, message, answer)
+            return {"answer": answer, "sources": []}
+
+        return {"answer": answer, "sources": self._extract_sources(response)}
 
     async def chat_stream(
         self,
@@ -103,7 +126,23 @@ class RAGEngine:
         message: str,
         collection: Literal["experiences", "advice", "both"] = "both",
     ) -> AsyncGenerator[str, None]:
-        engine = self._build_chat_engine(session_id, collection)
-        streaming_response = await engine.astream_chat(message)
-        async for token in streaming_response.async_response_gen():
-            yield token
+        # Retrieve nodes first to decide which path to take.
+        # This avoids yielding LlamaIndex's "Empty Response" sentinel mid-stream.
+        retriever = self._build_retriever(collection)
+        nodes = await retriever.aretrieve(message)
+
+        if not nodes:
+            # No documents — stream directly from the LLM using session memory.
+            messages = self._build_direct_messages(session_id, message)
+            stream = await LlamaSettings.llm.astream_chat(messages)
+            full_text = ""
+            async for chunk in stream:
+                if chunk.delta:
+                    full_text += chunk.delta
+                    yield chunk.delta
+            self._update_memory(session_id, message, full_text)
+        else:
+            engine = self._build_chat_engine(session_id, collection)
+            streaming_response = await engine.astream_chat(message)
+            async for token in streaming_response.async_response_gen():
+                yield token
