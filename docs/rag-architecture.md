@@ -1,6 +1,6 @@
 # happy-wife-gpt — RAG System Architecture
 
-> A breakdown of the full pipeline: how documents are ingested, embedded, stored, retrieved, fused, and used to generate grounded responses — and how a safety gate routes signs of abuse away from ordinary conflict coaching before any of that runs.
+> A breakdown of the full pipeline: how requests are authenticated and rate-limited, how documents are ingested, embedded, stored, retrieved, fused, and used to generate grounded responses — and how a safety gate routes signs of abuse away from ordinary conflict coaching before any of that runs.
 
 ---
 
@@ -10,7 +10,8 @@
 flowchart LR
     subgraph Ingest["📥 Ingest Path"]
         U1(User uploads file) --> API1(POST /ingest)
-        API1 --> Parse
+        API1 --> Gate1{🔒 Request Gating}
+        Gate1 --> Parse
         Parse --> Chunk
         Chunk --> Embed1(Embed chunks)
         Embed1 --> Store[(ChromaDB)]
@@ -18,7 +19,8 @@ flowchart LR
 
     subgraph Chat["💬 Chat Path"]
         U2(User sends message) --> API2(POST /chat)
-        API2 --> Safety{🛑 Safety Gate}
+        API2 --> Gate2{🔒 Request Gating}
+        Gate2 --> Safety{🛑 Safety Gate}
         Safety -->|abuse signals detected| SafetyResp(Safety resources<br/>no RAG, no coaching)
         Safety -->|no signals| Condense
         Condense --> Embed2(Embed condensed query)
@@ -36,6 +38,9 @@ flowchart LR
     OpenAI -.->|gpt-4o-mini| Generate
     OpenAI -.->|gpt-4o-mini classifier| Safety
 ```
+
+> 🔒 Request Gating (auth, body validation, rate limiting) — see §2 — happens on **every**
+> request, before either path's real work begins.
 
 ---
 
@@ -81,7 +86,44 @@ flowchart TD
 
 ---
 
-## 2. Safety Gate
+## 2. Request Gating
+
+Runs on every `POST /chat` and `POST /ingest` request, before either endpoint's real work
+begins (including before the Safety Gate in §3). Three independent checks, and — this matters
+for interpreting logs — **they run in different relative order on the two endpoints**, verified
+empirically against the running server rather than assumed from the code:
+
+```mermaid
+flowchart TD
+    A([Request]) --> B{X-API-Key valid?<br/>skipped entirely if<br/>API_KEY unset}
+    B -->|No| C[401 Unauthorized<br/>— never reaches rate limiter]
+    B -->|Yes| D{"/chat: message body<br/>1–4000 chars?"}
+    D -->|No| E["422 Unprocessable Entity<br/>— does NOT consume rate-limit budget"]
+    D -->|Yes, or /ingest<br/>no body schema to check yet| F{Rate limit<br/>per client IP}
+    F -->|"/chat: >20/min"| G[429 Too Many Requests]
+    F -->|"/ingest: >10/min"| G
+    F -->|Under limit| H["Continue: /chat → §3 Safety Gate<br/>/ingest → extension check (§1),<br/>which CAN push you over the<br/>limit since it runs after this gate"]
+```
+
+### Step-by-step
+
+| Step | Code | Detail |
+|---|---|---|
+| **Auth** | `auth.py → require_api_key`, router-level `Depends` | Checked first, before anything else. No-op (always passes) when `API_KEY` is unset in `.env` — local-dev convenience. As of this pass, a real key is generated and set by default, so auth is enforced unless you deliberately clear it |
+| **Body validation (`/chat` only)** | `models/schemas.py → ChatRequest.message` | Pydantic `min_length=1, max_length=4000`, resolved as part of FastAPI's parameter binding — happens *before* the rate-limit decorator runs, so oversized/empty messages don't cost you rate-limit budget. Verified: 25 consecutive oversized requests all returned 422, never 429 |
+| **Rate limiting** | `rate_limit.py` shared `Limiter` (slowapi), `@limiter.limit(...)` on each route | Per-client-IP, in-memory (`get_remote_address` key func), fixed/moving window. `/chat`: 20/min. `/ingest`: 10/min |
+| **`/ingest` extension check runs *after* rate limiting** | `routers/ingest.py → ingest_document()` | Unlike `/chat`'s message length, the `.txt`/`.md`/`.pdf` extension check is plain code inside the endpoint body, which only executes *after* the rate-limit decorator has already counted the request. Verified: sending 15 bad-extension uploads returned `400` for the first 10, then `429` for the rest — bad uploads do burn your `/ingest` rate-limit budget |
+
+> **Why this asymmetry exists, not just what it is:** `/chat`'s validation is a Pydantic field on
+> the request body, which FastAPI resolves *before* calling the (decorated) endpoint function —
+> so it runs ahead of the `@limiter.limit()` decorator, which only executes once the function body
+> starts. `/ingest` has no such body schema (it's `File(...)` + `Query(...)`), so its equivalent
+> check is hand-written code *inside* the function — by the time it runs, the rate limiter has
+> already counted the request.
+
+---
+
+## 3. Safety Gate
 
 Runs first, before any retrieval or the marriage-counselor persona. Distinguishes ordinary
 relationship conflict (safe to coach) from signs of intimate partner violence or coercive control
@@ -97,7 +139,7 @@ flowchart TD
     C -->|Match| D[flag_session_safety]
     C -->|No match| G[LLM classifier<br/>classify_abuse_risk]
     G -->|YES| D
-    G -->|NO| H[Not flagged →<br/>continue to §3 Retrieval Pipeline]
+    G -->|NO| H[Not flagged →<br/>continue to §4 Retrieval Pipeline]
     D --> E{Is this the<br/>flagging turn?}
     E -->|Yes, first time| I["Fixed SAFETY_RESOURCES_RESPONSE<br/>hard-coded text, not LLM-generated"]
     E -->|No, already flagged this turn| F
@@ -115,21 +157,20 @@ flowchart TD
 | **Flag + persist** | `ChatHistoryStore.flag_session_safety()` | Sets `chat_sessions.safety_flagged = 1`; sticky for the rest of the session |
 | **First flagged turn** | `rag/safety.py → SAFETY_RESOURCES_RESPONSE` | A fixed, hand-written string (National DV Hotline, text line, thehotline.org, 911) — deterministic on purpose, since this is the highest-stakes single message |
 | **Later flagged turns** | `rag/prompts.py → SAFETY_SYSTEM_PROMPT` | Direct LLM call (no `CondensePlusContextChatEngine`, no retrieval) with a system prompt that forbids "both sides"/de-escalation framing and forbids suggesting couples counseling — advocates specifically advise against joint counseling when abuse is present |
-| **Not flagged** | — | Falls through unchanged to the normal Retrieval → Generation pipeline (§3–4) with `MARRIAGE_COUNSELOR_SYSTEM_PROMPT` |
+| **Not flagged** | — | Falls through unchanged to the normal Retrieval → Generation pipeline (§4–5) with `MARRIAGE_COUNSELOR_SYSTEM_PROMPT` |
 
 > **Known limitation.** The keyword list is a starting point covering the CDC/Hotline categories (fear, threats, violence, coercive control, isolation, stalking, forced sex, financial control, retaliation), not an exhaustive detector — real disclosures vary widely in phrasing. The LLM classifier is the safety net for phrasing the keyword list misses, but is still probabilistic.
 
 ---
 
-## 3. Retrieval Pipeline
+## 4. Retrieval Pipeline
 
-Only reached when the Safety Gate (§2) does **not** flag the message. How a user's message is
+Only reached when the Safety Gate (§3) does **not** flag the message. How a user's message is
 turned into a vector query and matched against stored chunks.
 
 ```mermaid
 flowchart TD
-    A([User message\nPOST /chat]) --> B[Auth check\nX-API-Key header]
-    B --> C[Load ChatMemoryBuffer\nfor session_id\n4096 token limit]
+    A([User message\nPOST /chat\npassed §2 Gating + §3 Safety Gate]) --> C[Load ChatMemoryBuffer\nfor session_id\n4096 token limit]
 
     C --> D[CondensePlusContextChatEngine\nStep 1: Condense]
     D --> E[gpt-4o-mini rewrites\nchat history + new message\n→ standalone query]
@@ -156,7 +197,7 @@ flowchart TD
 
 | Step | Code | Detail |
 |---|---|---|
-| **Session memory** | `RAGEngine._get_memory()` | `ChatMemoryBuffer` keyed by `session_id`, cached in-process; holds turn history up to 4096 tokens, evicts oldest turns when full. On cache miss (e.g. after a server restart), reseeded from `ChatHistoryStore.load_history()` — see §5b |
+| **Session memory** | `RAGEngine._get_memory()` | `ChatMemoryBuffer` keyed by `session_id`, cached in-process; holds turn history up to 4096 tokens, evicts oldest turns when full. On cache miss (e.g. after a server restart), reseeded from `ChatHistoryStore.load_history()` — see §6b |
 | **Condense** | `CondensePlusContextChatEngine` Step 1 | GPT-4o-mini rewrites `[history + message]` into a self-contained query — removes pronouns, resolves references |
 | **Embed query** | `text-embedding-3-small` | Condensed query → 1536-dim vector; same model used at ingest time |
 | **Single retrieval** | `VectorStoreIndex.as_retriever(similarity_top_k=5)` | Cosine similarity search in HNSW index; returns top-5 nodes with scores |
@@ -168,11 +209,11 @@ flowchart TD
 
 ---
 
-## 4. Generation Pipeline
+## 5. Generation Pipeline
 
 How retrieved context is assembled into a prompt and streamed back. This is the path for
-messages that pass the Safety Gate (§2) unflagged — flagged sessions skip straight to a direct
-LLM call with `SAFETY_SYSTEM_PROMPT` and no retrieved chunks at all (see §2).
+messages that pass the Safety Gate (§3) unflagged — flagged sessions skip straight to a direct
+LLM call with `SAFETY_SYSTEM_PROMPT` and no retrieved chunks at all (see §3).
 
 ```mermaid
 flowchart TD
@@ -233,7 +274,10 @@ The frontend reads this via `fetch` + `ReadableStream` (not `EventSource`, which
 
 ---
 
-## 5. Full End-to-End Sequence
+## 6. Full End-to-End Sequence
+
+Request Gating (§2 — auth, body validation, rate limiting) applies to every `/chat` and
+`/ingest` call below; omitted from the diagram itself to keep it readable.
 
 ```mermaid
 sequenceDiagram
@@ -258,7 +302,7 @@ sequenceDiagram
     API-->>FE: {status: ok, chunks_stored: N}
     FE-->>User: "✓ advice.pdf — N chunks indexed"
 
-    Note over User,SQLite: ── SESSION START / RESUME (see §5b) ──
+    Note over User,SQLite: ── SESSION START / RESUME (see §6b) ──
 
     FE->>FE: Check localStorage for saved session_id
     alt No saved session
@@ -282,7 +326,7 @@ sequenceDiagram
     Engine->>SQLite: is_session_flagged(session_id)?
     SQLite-->>Engine: false
 
-    alt Safety Gate flags the message (see §2)
+    alt Safety Gate flags the message (see §3)
         Engine->>SQLite: flag_session_safety(session_id)
         Engine-->>API: fixed SAFETY_RESOURCES_RESPONSE
         Note over Engine,Chroma: No retrieval, no advice corpus
@@ -313,7 +357,7 @@ sequenceDiagram
     API-->>FE: data: [DONE]
 ```
 
-### 5b. Session persistence notes
+### 6b. Session persistence notes
 
 - **Reload survives.** `session_id` lives in `localStorage`, not just React state — refreshing the
   page re-fetches history from SQLite instead of starting a new conversation.
@@ -325,7 +369,7 @@ sequenceDiagram
 
 ---
 
-## 6. Component Reference
+## 7. Component Reference
 
 | Component | Implementation | Config key | Default |
 |---|---|---|---|
@@ -347,10 +391,13 @@ sequenceDiagram
 | **Collections** | `experiences`, `advice` | — | two separate HNSW indexes |
 | **Doc ID scheme** | `{stem[:32]}_{sha256[:12]}` | — | deterministic |
 | **Supported file types** | `.txt`, `.md`, `.pdf` | — | hardcoded |
+| **Auth** | `X-API-Key` header, `auth.py → require_api_key` | `API_KEY` | enforced when set — a real key is now generated by default (see §2) |
+| **Rate limiting** | `slowapi`, per-IP, in-memory (`rate_limit.py`) | — | `/chat` 20/min, `/ingest` 10/min (see §2 for precedence order) |
+| **Chat message length** | Pydantic `Field(min_length=1, max_length=4000)` | — | on `ChatRequest.message` only — `/ingest` has no equivalent body-level check |
 
 ---
 
-## 7. Two-Collection Design
+## 8. Two-Collection Design
 
 ```
 ChromaDB
@@ -367,7 +414,7 @@ When `collection=both` (default in chat), both indexes are searched in parallel 
 
 ---
 
-## 8. Honest Gaps (not yet implemented)
+## 9. Honest Gaps (not yet implemented)
 
 | Gap | Where it would go | Notes |
 |---|---|---|
@@ -376,6 +423,9 @@ When `collection=both` (default in chat), both indexes are searched in parallel 
 | **Hybrid search** | Replace `VectorStoreIndex` retriever with a hybrid retriever | Combine keyword (BM25) + vector for better lexical recall |
 | **Query expansion** | `QueryFusionRetriever(num_queries > 1)` | Set `num_queries=3` to generate multiple phrasings of the query; improves recall at cost of latency + API tokens |
 | **Metadata filtering** | `retriever.retrieve(query, filters=...)` | e.g. filter by date range, collection, or doc_id |
-| **Safety keyword coverage** | `rag/safety.py → _HIGH_RISK_PATTERNS` | Starting-point list, not exhaustive — see the limitation note in §2 |
+| **Safety keyword coverage** | `rag/safety.py → _HIGH_RISK_PATTERNS` | Starting-point list, not exhaustive — see the limitation note in §3 |
 | **Safety classifier cost/latency control** | `rag/engine.py → _check_safety()` | Every unflagged message pays one extra `gpt-4o-mini` call when the keyword gate finds nothing; no caching or batching yet |
 | **Chat history on RDS Postgres** | `storage/chat_history_postgres.py` (not built) | Local SQLite only today; AWS path documented but unimplemented — see `docs/production-roadmap.md` Phase D |
+| **Single shared API key** | `auth.py → require_api_key` | One static key for everyone, not per-user — fine for personal/local use, not a real multi-user auth model |
+| **In-memory rate limiter** | `rate_limit.py` | Per-process, per-IP state — resets on restart and won't coordinate correctly across multiple backend instances (relevant once deployed behind ECS with >1 task) |
+| **`/ingest` has no body-level length/size limit** | `routers/ingest.py` | Unlike `/chat`, there's no explicit file-size cap — relies on FastAPI/Starlette defaults |
