@@ -36,10 +36,20 @@ def mock_engine():
 
 
 @pytest.fixture
-def client(mock_store, mock_engine):
+def history_store(tmp_path):
+    from backend.config import Settings
+    from backend.storage.chat_history import ChatHistoryStore
+
+    settings = Settings(chat_history_db_path=str(tmp_path / "chat_history.db"))
+    return ChatHistoryStore(settings)
+
+
+@pytest.fixture
+def client(mock_store, mock_engine, history_store):
     from backend.main import app
 
     with patch("backend.main.get_vector_store", return_value=mock_store), \
+         patch("backend.main.ChatHistoryStore", return_value=history_store), \
          patch("backend.main.RAGEngine", return_value=mock_engine):
         with TestClient(app) as c:
             app.state.settings.api_key = TEST_API_KEY

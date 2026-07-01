@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     opensearch_endpoint: str = ""
     aws_region: str = "ap-southeast-1"
 
+    # Chat history
+    chat_history_db_path: str = "./chat_history.db"
+
     # App
     cors_origins: list[str] = Field(default=["http://localhost:5173"])
 

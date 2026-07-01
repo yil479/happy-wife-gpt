@@ -10,6 +10,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./chroma_db:/app/chroma_db
+      - ./chat_history.db:/app/chat_history.db
     restart: unless-stopped
 
   frontend:

@@ -8,6 +8,16 @@ class SessionResponse(BaseModel):
     session_id: str
 
 
+class ChatHistoryMessage(BaseModel):
+    role: str
+    content: str
+    created_at: str
+
+
+class SessionHistoryResponse(BaseModel):
+    messages: list[ChatHistoryMessage]
+
+
 # --- Ingest ---
 
 class IngestResponse(BaseModel):

@@ -1,6 +1,6 @@
 # happy-wife-gpt — RAG System Architecture
 
-> A breakdown of the full pipeline: how documents are ingested, embedded, stored, retrieved, fused, and used to generate grounded responses.
+> A breakdown of the full pipeline: how documents are ingested, embedded, stored, retrieved, fused, and used to generate grounded responses — and how a safety gate routes signs of abuse away from ordinary conflict coaching before any of that runs.
 
 ---
 
@@ -18,18 +18,23 @@ flowchart LR
 
     subgraph Chat["💬 Chat Path"]
         U2(User sends message) --> API2(POST /chat)
-        API2 --> Condense
+        API2 --> Safety{🛑 Safety Gate}
+        Safety -->|abuse signals detected| SafetyResp(Safety resources<br/>no RAG, no coaching)
+        Safety -->|no signals| Condense
         Condense --> Embed2(Embed condensed query)
         Embed2 --> Retrieve
         Store --> Retrieve
         Retrieve --> Generate(GPT-4o-mini)
         Generate --> Response(Streaming SSE / JSON)
+        SafetyResp --> Response
+        Response -.->|persist turn +<br/>safety_flagged| History[(SQLite)]
     end
 
     OpenAI([OpenAI API]) -.->|text-embedding-3-small| Embed1
     OpenAI -.->|text-embedding-3-small| Embed2
     OpenAI -.->|gpt-4o-mini| Condense
     OpenAI -.->|gpt-4o-mini| Generate
+    OpenAI -.->|gpt-4o-mini classifier| Safety
 ```
 
 ---
@@ -76,9 +81,50 @@ flowchart TD
 
 ---
 
-## 2. Retrieval Pipeline
+## 2. Safety Gate
 
-How a user's message is turned into a vector query and matched against stored chunks.
+Runs first, before any retrieval or the marriage-counselor persona. Distinguishes ordinary
+relationship conflict (safe to coach) from signs of intimate partner violence or coercive control
+(unsafe to coach — routed to hotline resources instead). Sticky per session: once a session is
+flagged, it stays flagged for every subsequent turn, even if later messages don't repeat risk
+language.
+
+```mermaid
+flowchart TD
+    A([User message]) --> B{Session already<br/>safety_flagged in SQLite?}
+    B -->|Yes| F["Safety-mode reply<br/>SAFETY_SYSTEM_PROMPT, direct LLM<br/>(no retrieval, no advice corpus)"]
+    B -->|No| C{Keyword gate<br/>contains_high_risk_language}
+    C -->|Match| D[flag_session_safety]
+    C -->|No match| G[LLM classifier<br/>classify_abuse_risk]
+    G -->|YES| D
+    G -->|NO| H[Not flagged →<br/>continue to §3 Retrieval Pipeline]
+    D --> E{Is this the<br/>flagging turn?}
+    E -->|Yes, first time| I["Fixed SAFETY_RESOURCES_RESPONSE<br/>hard-coded text, not LLM-generated"]
+    E -->|No, already flagged this turn| F
+    I --> J[(chat_messages<br/>persisted, sources: empty)]
+    F --> J
+```
+
+### Step-by-step
+
+| Step | Code | Detail |
+|---|---|---|
+| **Sticky check** | `ChatHistoryStore.is_session_flagged()` | If the session was already flagged on a prior turn, skip straight to safety-mode reply — no keyword/LLM check needed |
+| **Keyword gate** | `rag/safety.py → contains_high_risk_language()` | Deterministic regex match for explicit red flags: physical violence, weapons, threats to kill/hurt, fear of partner, sexual coercion, stalking, surveillance, isolation, financial control. Zero LLM involvement — the clearest, highest-danger disclosures never depend on model judgment |
+| **LLM classifier fallback** | `rag/safety.py → classify_abuse_risk()` | Only runs if the keyword gate found nothing. One extra `gpt-4o-mini` call, given the message + last 6 turns of memory, forced to answer `YES`/`NO` against a CDC/Hotline-derived rubric — catches indirect disclosures ("he doesn't let me see my friends anymore") that keywords miss |
+| **Flag + persist** | `ChatHistoryStore.flag_session_safety()` | Sets `chat_sessions.safety_flagged = 1`; sticky for the rest of the session |
+| **First flagged turn** | `rag/safety.py → SAFETY_RESOURCES_RESPONSE` | A fixed, hand-written string (National DV Hotline, text line, thehotline.org, 911) — deterministic on purpose, since this is the highest-stakes single message |
+| **Later flagged turns** | `rag/prompts.py → SAFETY_SYSTEM_PROMPT` | Direct LLM call (no `CondensePlusContextChatEngine`, no retrieval) with a system prompt that forbids "both sides"/de-escalation framing and forbids suggesting couples counseling — advocates specifically advise against joint counseling when abuse is present |
+| **Not flagged** | — | Falls through unchanged to the normal Retrieval → Generation pipeline (§3–4) with `MARRIAGE_COUNSELOR_SYSTEM_PROMPT` |
+
+> **Known limitation.** The keyword list is a starting point covering the CDC/Hotline categories (fear, threats, violence, coercive control, isolation, stalking, forced sex, financial control, retaliation), not an exhaustive detector — real disclosures vary widely in phrasing. The LLM classifier is the safety net for phrasing the keyword list misses, but is still probabilistic.
+
+---
+
+## 3. Retrieval Pipeline
+
+Only reached when the Safety Gate (§2) does **not** flag the message. How a user's message is
+turned into a vector query and matched against stored chunks.
 
 ```mermaid
 flowchart TD
@@ -110,7 +156,7 @@ flowchart TD
 
 | Step | Code | Detail |
 |---|---|---|
-| **Session memory** | `RAGEngine._get_memory()` | `ChatMemoryBuffer` keyed by `session_id`; holds full turn history up to 4096 tokens; evicts oldest turns when full |
+| **Session memory** | `RAGEngine._get_memory()` | `ChatMemoryBuffer` keyed by `session_id`, cached in-process; holds turn history up to 4096 tokens, evicts oldest turns when full. On cache miss (e.g. after a server restart), reseeded from `ChatHistoryStore.load_history()` — see §5b |
 | **Condense** | `CondensePlusContextChatEngine` Step 1 | GPT-4o-mini rewrites `[history + message]` into a self-contained query — removes pronouns, resolves references |
 | **Embed query** | `text-embedding-3-small` | Condensed query → 1536-dim vector; same model used at ingest time |
 | **Single retrieval** | `VectorStoreIndex.as_retriever(similarity_top_k=5)` | Cosine similarity search in HNSW index; returns top-5 nodes with scores |
@@ -122,9 +168,11 @@ flowchart TD
 
 ---
 
-## 3. Generation Pipeline
+## 4. Generation Pipeline
 
-How retrieved context is assembled into a prompt and streamed back.
+How retrieved context is assembled into a prompt and streamed back. This is the path for
+messages that pass the Safety Gate (§2) unflagged — flagged sessions skip straight to a direct
+LLM call with `SAFETY_SYSTEM_PROMPT` and no retrieved chunks at all (see §2).
 
 ```mermaid
 flowchart TD
@@ -185,7 +233,7 @@ The frontend reads this via `fetch` + `ReadableStream` (not `EventSource`, which
 
 ---
 
-## 4. Full End-to-End Sequence
+## 5. Full End-to-End Sequence
 
 ```mermaid
 sequenceDiagram
@@ -194,9 +242,10 @@ sequenceDiagram
     participant API as FastAPI<br/>(backend/main.py)
     participant Engine as RAGEngine<br/>(rag/engine.py)
     participant OAI as OpenAI API
-    participant DB as ChromaDB
+    participant Chroma as ChromaDB
+    participant SQLite as SQLite<br/>(chat_history.db)
 
-    Note over User,DB: ── INGEST PATH ──
+    Note over User,SQLite: ── INGEST PATH ──
 
     User->>FE: Upload advice.pdf to "advice"
     FE->>API: POST /ingest?collection=advice
@@ -204,44 +253,79 @@ sequenceDiagram
     API->>API: SentenceSplitter → N chunks
     API->>OAI: Embed N chunks<br/>(text-embedding-3-small)
     OAI-->>API: N × [1536-dim vectors]
-    API->>DB: insert_nodes() → store vectors + metadata
-    DB-->>API: ack
+    API->>Chroma: insert_nodes() → store vectors + metadata
+    Chroma-->>API: ack
     API-->>FE: {status: ok, chunks_stored: N}
     FE-->>User: "✓ advice.pdf — N chunks indexed"
 
-    Note over User,DB: ── CHAT PATH ──
+    Note over User,SQLite: ── SESSION START / RESUME (see §5b) ──
+
+    FE->>FE: Check localStorage for saved session_id
+    alt No saved session
+        FE->>API: POST /sessions
+        API->>SQLite: create_session(session_id)
+        API-->>FE: {session_id}
+        FE->>FE: Save session_id to localStorage
+    else Saved session exists
+        FE->>API: GET /sessions/{id}/history
+        API->>SQLite: load_history(session_id)
+        SQLite-->>API: prior messages[]
+        API-->>FE: {messages[]}
+        FE->>FE: Render restored conversation
+    end
+
+    Note over User,SQLite: ── CHAT PATH ──
 
     User->>FE: "We keep arguing about dishes"
-    FE->>API: POST /sessions
-    API-->>FE: {session_id: "uuid"}
     FE->>API: POST /chat {session_id, message, stream:true}
     API->>Engine: chat_stream(session_id, message, "both")
-    Engine->>Engine: Load ChatMemoryBuffer for session
-    Engine->>OAI: Condense history + message → standalone query
-    OAI-->>Engine: "standalone condensed query"
-    Engine->>OAI: Embed condensed query
-    OAI-->>Engine: [1536-dim vector]
-    par Parallel retrieval
-        Engine->>DB: cosine search in "experiences" top-5
-        DB-->>Engine: nodes[]
-    and
-        Engine->>DB: cosine search in "advice" top-5
-        DB-->>Engine: nodes[]
+    Engine->>SQLite: is_session_flagged(session_id)?
+    SQLite-->>Engine: false
+
+    alt Safety Gate flags the message (see §2)
+        Engine->>SQLite: flag_session_safety(session_id)
+        Engine-->>API: fixed SAFETY_RESOURCES_RESPONSE
+        Note over Engine,Chroma: No retrieval, no advice corpus
+    else Not flagged — normal coaching path
+        Engine->>Engine: Load ChatMemoryBuffer for session<br/>(reseeded from SQLite if not cached)
+        Engine->>OAI: Condense history + message → standalone query
+        OAI-->>Engine: "standalone condensed query"
+        Engine->>OAI: Embed condensed query
+        OAI-->>Engine: [1536-dim vector]
+        par Parallel retrieval
+            Engine->>Chroma: cosine search in "experiences" top-5
+            Chroma-->>Engine: nodes[]
+        and
+            Engine->>Chroma: cosine search in "advice" top-5
+            Chroma-->>Engine: nodes[]
+        end
+        Engine->>Engine: RRF merge → ranked candidates
+        Engine->>OAI: Generate with context + memory + system prompt<br/>(gpt-4o-mini, streaming)
+        loop SSE stream
+            OAI-->>Engine: token
+            Engine-->>API: token
+            API-->>FE: data: {"token": "..."}
+            FE-->>User: append token to bubble
+        end
     end
-    Engine->>Engine: RRF merge → ranked candidates
-    Engine->>OAI: Generate with context + memory + system prompt<br/>(gpt-4o-mini, streaming)
-    loop SSE stream
-        OAI-->>Engine: token
-        Engine-->>API: token
-        API-->>FE: data: {"token": "..."}
-        FE-->>User: append token to bubble
-    end
+
+    Engine->>SQLite: save_turn(session_id, message, answer)
     API-->>FE: data: [DONE]
 ```
 
+### 5b. Session persistence notes
+
+- **Reload survives.** `session_id` lives in `localStorage`, not just React state — refreshing the
+  page re-fetches history from SQLite instead of starting a new conversation.
+- **Restart survives.** `ChatMemoryBuffer` is an in-process cache keyed by `session_id`; on a cache
+  miss (fresh process) it's reseeded from `ChatHistoryStore.load_history()`, so a backend restart
+  doesn't lose conversational context either.
+- **"New Conversation"** (frontend menu) calls `POST /sessions` again and overwrites the stored
+  `session_id`, starting a genuinely fresh session — including a fresh (unflagged) safety state.
+
 ---
 
-## 5. Component Reference
+## 6. Component Reference
 
 | Component | Implementation | Config key | Default |
 |---|---|---|---|
@@ -254,15 +338,19 @@ sequenceDiagram
 | **Chunker** | `SentenceSplitter` | `CHUNK_SIZE` / `CHUNK_OVERLAP` | 512 / 64 |
 | **Retrieval top-k** | per collection | `RETRIEVAL_TOP_K` | 5 |
 | **Fusion** | `QueryFusionRetriever` + RRF | — | when collection=`both` |
-| **Chat engine** | `CondensePlusContextChatEngine` | — | always |
-| **Session memory** | `ChatMemoryBuffer` | `MEMORY_TOKEN_LIMIT` | 4096 tokens |
+| **Chat engine** | `CondensePlusContextChatEngine` | — | always (when not safety-flagged) |
+| **Session memory** | `ChatMemoryBuffer`, in-process cache reseeded from SQLite | `MEMORY_TOKEN_LIMIT` | 4096 tokens |
+| **Chat history store** | SQLite via stdlib `sqlite3` (`ChatHistoryStore`) | `CHAT_HISTORY_DB_PATH` | `./chat_history.db` |
+| **Chat history store (AWS)** | RDS PostgreSQL (planned, not built) | — | see `docs/production-roadmap.md` Phase D |
+| **Safety detection** | Regex keyword gate + `gpt-4o-mini` classifier fallback (`rag/safety.py`) | — | hybrid, sticky per session |
+| **Safety response** | Fixed hotline referral text; no couples-counseling suggestion | — | hard-coded, not LLM-generated |
 | **Collections** | `experiences`, `advice` | — | two separate HNSW indexes |
 | **Doc ID scheme** | `{stem[:32]}_{sha256[:12]}` | — | deterministic |
 | **Supported file types** | `.txt`, `.md`, `.pdf` | — | hardcoded |
 
 ---
 
-## 6. Two-Collection Design
+## 7. Two-Collection Design
 
 ```
 ChromaDB
@@ -279,13 +367,15 @@ When `collection=both` (default in chat), both indexes are searched in parallel 
 
 ---
 
-## 7. Honest Gaps (not yet implemented)
+## 8. Honest Gaps (not yet implemented)
 
 | Gap | Where it would go | Notes |
 |---|---|---|
 | **Cross-encoder reranker** | Post-retrieval step in `_build_retriever()` | e.g. Cohere Rerank or `llama-index-postprocessor-cohere-rerank`; would improve precision especially for `both` collection queries |
 | **Score threshold filtering** | `_build_retriever()` or as a node postprocessor | `MIN_SCORE=0.3` exists in config but is not wired into the retriever |
-| **Persistent chat history** | New `storage/sqlite.py` + `ChatMemoryBuffer` persistence | Currently in-memory; lost on server restart |
 | **Hybrid search** | Replace `VectorStoreIndex` retriever with a hybrid retriever | Combine keyword (BM25) + vector for better lexical recall |
 | **Query expansion** | `QueryFusionRetriever(num_queries > 1)` | Set `num_queries=3` to generate multiple phrasings of the query; improves recall at cost of latency + API tokens |
 | **Metadata filtering** | `retriever.retrieve(query, filters=...)` | e.g. filter by date range, collection, or doc_id |
+| **Safety keyword coverage** | `rag/safety.py → _HIGH_RISK_PATTERNS` | Starting-point list, not exhaustive — see the limitation note in §2 |
+| **Safety classifier cost/latency control** | `rag/engine.py → _check_safety()` | Every unflagged message pays one extra `gpt-4o-mini` call when the keyword gate finds nothing; no caching or batching yet |
+| **Chat history on RDS Postgres** | `storage/chat_history_postgres.py` (not built) | Local SQLite only today; AWS path documented but unimplemented — see `docs/production-roadmap.md` Phase D |

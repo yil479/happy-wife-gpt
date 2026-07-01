@@ -22,6 +22,16 @@ export interface ChatResponse {
   sources: SourceChunk[]
 }
 
+export interface ChatHistoryMessage {
+  role: string
+  content: string
+  created_at: string
+}
+
+export interface SessionHistoryResponse {
+  messages: ChatHistoryMessage[]
+}
+
 export interface ChatRequest {
   session_id: string
   message: string
@@ -77,6 +87,14 @@ export async function createSession(): Promise<SessionResponse> {
   })
   await checkResponse(res)
   return res.json() as Promise<SessionResponse>
+}
+
+export async function getSessionHistory(sessionId: string): Promise<SessionHistoryResponse> {
+  const res = await fetch(`${BASE_URL}/sessions/${encodeURIComponent(sessionId)}/history`, {
+    headers: authHeaders(),
+  })
+  await checkResponse(res)
+  return res.json() as Promise<SessionHistoryResponse>
 }
 
 export async function streamChat(
