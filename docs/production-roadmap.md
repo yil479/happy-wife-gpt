@@ -12,14 +12,16 @@
 | React frontend | ✅ Complete | Chat UI, slide-in document panel, pink/purple theme |
 | RAG engine | ✅ Complete | LlamaIndex + gpt-4o-mini + text-embedding-3-small |
 | ChromaDB (local) | ✅ Complete | `experiences` + `advice` collections, cosine HNSW |
-| X-API-Key auth | ✅ Complete | Disabled when `API_KEY` unset (local dev convenience) |
+| X-API-Key auth | ✅ Complete | Real key generated and set in local `.env` + `frontend/.env`; enforced by default now |
 | Docker Compose | ✅ Complete | Backend + frontend, local dev |
-| Tests | ✅ Complete | 42 passing, fully mocked, no API keys needed |
+| Tests | ✅ Complete | 47 passing, fully mocked, no API keys needed |
 | OpenSearch backend | ⚠️ Stub | Three methods raise `NotImplementedError` |
 | S3 storage backend | ❌ Missing | Not implemented |
 | Persistent chat history | ✅ Complete | SQLite locally (`ChatHistoryStore`); RDS Postgres still pending for AWS (Phase D below) |
 | IPV/abuse safety gate | ✅ Complete | Keyword + LLM classifier routes to hotline resources instead of conflict coaching, see `docs/rag-architecture.md` §2 |
-| Production auth | ❌ Missing | Need strong key + rate limiting at minimum |
+| Rate limiting | ✅ Complete | `slowapi`, `/chat` 20/min, `/ingest` 10/min, per-IP, in-memory |
+| Input length validation | ✅ Complete | `ChatRequest.message` capped at 4000 chars, min 1 |
+| Production auth | ⚠️ Partial | Real key + rate limiting done; still needs key rotation strategy for AWS (Secrets Manager) |
 | AWS infrastructure | ❌ Missing | All to be built |
 | CI/CD pipeline | ❌ Missing | GitHub Actions workflows to be created |
 | Monitoring | ❌ Missing | CloudWatch, alerting |
@@ -199,40 +201,29 @@ done
 
 Complete these locally first — they cost nothing and reduce risk immediately.
 
-### 2.1 Generate a real API key
+### 2.1 Generate a real API key ✅ Done
 
 ```bash
 openssl rand -hex 32
-# → e.g. a3f9c2d1e8b74f0...
 ```
 
-Add to `.env`:
-```
-API_KEY=a3f9c2d1e8b74f0...
-```
+Set in `.env` (`API_KEY=...`) and the matching value in `frontend/.env` (`VITE_API_KEY=...`),
+which is gitignored — see `.env.example` / `frontend/.env.example` for the placeholders. Auth is
+now enforced by default; previously it was disabled whenever `API_KEY` was empty.
 
-Add to `frontend/.env` (so the React app sends it):
-```
-VITE_API_KEY=a3f9c2d1e8b74f0...
-```
+> Full git history was searched for leaked OpenAI keys before this change (all commits, all refs)
+> — none found. `.env.example` has only ever contained the placeholder `your_openai_api_key_here`.
 
-> ⚠️ The OpenAI API key was briefly saved in `.env.example` during development. If you haven't already, rotate it at [platform.openai.com/api-keys](https://platform.openai.com/api-keys).
+### 2.2 Rate limiting ✅ Done
 
-### 2.2 Rate limiting
+`slowapi` added to `backend/requirements.txt`, wired into `backend/main.py` via
+`backend/rate_limit.py`'s shared `Limiter`. `/chat` is capped at 20/min per IP, `/ingest` at
+10/min per IP, in-memory (no Redis needed at this scale). Prevents accidental (or intentional)
+runaway API costs.
 
-Add `slowapi` to `backend/requirements.txt` and wire it into `backend/main.py`:
+### 2.3 Input length limits ✅ Done
 
-```python
-# ~20 chat requests / minute per IP (personal use)
-# ~10 ingest requests / minute per IP
-```
-
-This prevents accidental (or intentional) runaway API costs.
-
-### 2.3 Input length limits
-
-Add `max_length=4000` to `ChatRequest.message` in `backend/models/schemas.py` to prevent
-prompt injection via extremely long inputs.
+`ChatRequest.message` in `backend/models/schemas.py` now has `min_length=1, max_length=4000`.
 
 ### 2.4 CORS lockdown
 
@@ -464,11 +455,11 @@ Use **OIDC federation** (not static `AWS_ACCESS_KEY_ID`) — safer, no key rotat
 ## Recommended Order of Work
 
 ```
-[ ] 1. Write and ingest 5–10 experience entries  ← unblocks useful RAG immediately
-[ ] 2. Generate and set a real API_KEY in .env
-[ ] 3. Add rate limiting (slowapi)
-[ ] 4. Add input length validation to ChatRequest
-[ ] 5. Implement persistent chat history (SQLite first, then RDS)
+[x] 1. Write and ingest 5–10 experience entries  ← unblocks useful RAG immediately
+[x] 2. Generate and set a real API_KEY in .env
+[x] 3. Add rate limiting (slowapi)
+[x] 4. Add input length validation to ChatRequest
+[x] 5. Implement persistent chat history (SQLite first, then RDS)
 [ ] 6. Set up AWS account + billing alerts
 [ ] 7. Phase A — ECR + test container locally
 [ ] 8. Phase B — ECS Fargate backend

@@ -44,6 +44,14 @@ def history_store(tmp_path):
     return ChatHistoryStore(settings)
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    from backend.rate_limit import limiter
+
+    limiter.reset()
+    yield
+
+
 @pytest.fixture
 def client(mock_store, mock_engine, history_store):
     from backend.main import app

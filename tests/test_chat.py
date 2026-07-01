@@ -52,6 +52,36 @@ def test_chat_wrong_key(client):
     assert resp.status_code == 401
 
 
+def test_chat_rejects_empty_message(client):
+    session_id = client.post("/sessions", headers=AUTH_HEADERS).json()["session_id"]
+    resp = client.post(
+        "/chat",
+        headers=AUTH_HEADERS,
+        json={"session_id": session_id, "message": "", "stream": False},
+    )
+    assert resp.status_code == 422
+
+
+def test_chat_rejects_message_over_max_length(client):
+    session_id = client.post("/sessions", headers=AUTH_HEADERS).json()["session_id"]
+    resp = client.post(
+        "/chat",
+        headers=AUTH_HEADERS,
+        json={"session_id": session_id, "message": "x" * 4001, "stream": False},
+    )
+    assert resp.status_code == 422
+
+
+def test_chat_accepts_message_at_max_length(client):
+    session_id = client.post("/sessions", headers=AUTH_HEADERS).json()["session_id"]
+    resp = client.post(
+        "/chat",
+        headers=AUTH_HEADERS,
+        json={"session_id": session_id, "message": "x" * 4000, "stream": False},
+    )
+    assert resp.status_code == 200
+
+
 def test_health_is_public(client):
     resp = client.get("/health")
     assert resp.status_code == 200

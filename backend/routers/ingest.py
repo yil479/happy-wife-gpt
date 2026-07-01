@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Upl
 from backend.auth import require_api_key
 from backend.models.schemas import DocumentListResponse, DocumentMeta, IngestResponse
 from backend.rag.ingestion import ingest_upload
+from backend.rate_limit import limiter
 
 router = APIRouter(tags=["documents"], dependencies=[Depends(require_api_key)])
 
@@ -13,6 +14,7 @@ SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf"}
 
 
 @router.post("/ingest", response_model=IngestResponse)
+@limiter.limit("10/minute")
 async def ingest_document(
     request: Request,
     file: UploadFile = File(...),

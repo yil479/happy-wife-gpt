@@ -44,7 +44,7 @@ class DocumentListResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     session_id: str = Field(..., description="UUID identifying the conversation session")
-    message: str
+    message: str = Field(..., min_length=1, max_length=4000)
     collection: Literal["experiences", "advice", "both"] = "both"
     stream: bool = True
 

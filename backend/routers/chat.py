@@ -5,6 +5,7 @@ from fastapi.responses import StreamingResponse
 
 from backend.auth import require_api_key
 from backend.models.schemas import ChatRequest, ChatResponse, SourceChunk
+from backend.rate_limit import limiter
 
 router = APIRouter(tags=["chat"], dependencies=[Depends(require_api_key)])
 
@@ -16,6 +17,7 @@ async def _sse_generator(session_id: str, message: str, collection: str, engine)
 
 
 @router.post("/chat")
+@limiter.limit("20/minute")
 async def chat(req: ChatRequest, request: Request):
     engine = request.app.state.engine
 
