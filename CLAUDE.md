@@ -6,17 +6,22 @@ A RAG-powered marriage guidance chatbot. The user logs personal argument experie
 
 ## Tech Stack
 
-| Layer | Local | AWS (future) |
+| Layer | Local | GCP (future) |
 |---|---|---|
-| Frontend | React + TypeScript (Vite) | CloudFront + S3 |
-| Backend | Python + FastAPI + uvicorn | ECS Fargate (same Docker image) |
+| Frontend | React + TypeScript (Vite) | Firebase Hosting |
+| Backend | Python + FastAPI + uvicorn | Cloud Run (same Docker image) |
 | RAG framework | LlamaIndex | same |
 | LLM | OpenAI `gpt-4o-mini` | same |
 | Embeddings | OpenAI `text-embedding-3-small` | same |
-| Vector store | ChromaDB (local file) | OpenSearch Serverless |
-| File storage | Local `data/` folder | S3 |
-| Chat history | SQLite | RDS PostgreSQL |
-| Secrets | `.env` file | AWS Secrets Manager |
+| Vector store | ChromaDB (local file) | ChromaDB (same file, on a GCS-mounted Cloud Run volume — not Vertex AI) |
+| File storage | Local `data/` folder | Same `data/` folder, on the GCS-mounted volume — not a separate S3/GCS API backend |
+| Chat history | SQLite | Same SQLite file, on the GCS-mounted volume — not Cloud SQL |
+| Secrets | `.env` file | Secret Manager |
+
+> Deliberately *not* AWS. See `docs/production-roadmap.md` for the reasoning — Cloud Run scales
+> to zero and this design avoids anything billed by uptime (Cloud SQL, Vertex AI Vector Search),
+> which keeps a personal/low-traffic deployment near $0/month instead of the ~$40+/month a
+> managed-DB-and-vector-store setup would cost.
 
 ## Project Structure
 
@@ -39,8 +44,8 @@ happy-wife-gpt/
 │   │   └── prompts.py          # system prompt for marriage counselor persona
 │   ├── storage/
 │   │   ├── base.py             # abstract interface (upsert / query / list)
-│   │   ├── chroma.py           # ChromaDB implementation (local)
-│   │   └── opensearch.py       # OpenSearch implementation (AWS)
+│   │   ├── chroma.py           # ChromaDB implementation (local + GCP — same file, mounted via GCS on Cloud Run)
+│   │   └── opensearch.py       # OpenSearch stub, unused — GCP plan doesn't need it, see docs/production-roadmap.md
 │   └── models/
 │       └── schemas.py          # Pydantic request/response models
 ├── frontend/
@@ -70,10 +75,15 @@ happy-wife-gpt/
 ## Architecture Decisions
 
 ### Portability-first design
-All infrastructure choices are abstracted behind interfaces so swapping local → AWS is a config change, not a rewrite:
-- `VECTOR_STORE=chromadb` locally → `VECTOR_STORE=opensearch` on AWS
-- `STORAGE=local` locally → `STORAGE=s3` on AWS
-- Same Docker image runs locally (docker-compose) and on ECS Fargate
+Infrastructure choices are abstracted behind interfaces (`storage/base.py`, `config.py`'s
+`Literal["local","s3"]` / `Literal["chromadb","opensearch"]`), so a backend swap is a config
+change, not a rewrite — but the actual GCP plan deliberately **doesn't exercise that swap**:
+- `VECTOR_STORE_BACKEND` stays `chromadb`; `STORAGE_BACKEND` stays `local`. On Cloud Run they
+  point at a GCS-mounted volume instead of a container-local path — same code path, different
+  disk underneath. This is what keeps the deployment near $0/month (see `docs/production-roadmap.md`).
+- The `s3` / `opensearch` options exist in the type signature but have no working implementation
+  and aren't part of the current deployment plan.
+- Same Docker image runs locally (docker-compose) and on Cloud Run.
 
 ### Two ChromaDB collections
 - `experiences` — private logs of past arguments, emotional context, resolutions
@@ -100,7 +110,8 @@ LOCAL_DATA_DIR=./data
 VECTOR_STORE_BACKEND=chromadb
 CHROMA_PERSIST_DIR=./chroma_db
 
-# AWS (only needed when backends are set to aws values)
+# AWS (unused — kept only because storage_backend/vector_store_backend's type signature
+# still allows "s3"/"opensearch"; the actual GCP plan doesn't use these, see below)
 AWS_REGION=ap-southeast-1
 S3_BUCKET=
 OPENSEARCH_ENDPOINT=
@@ -139,16 +150,18 @@ pytest tests/
 | `GET` | `/documents` | List all ingested document sources |
 | `DELETE` | `/documents/{id}` | Remove a document from the index |
 
-## AWS Migration Path
+## GCP Migration Path
 
-When ready to move to AWS:
-1. Push Docker image to ECR
-2. Deploy backend to ECS Fargate
-3. Build frontend → upload to S3 → serve via CloudFront
-4. Swap `.env` vars: `VECTOR_STORE_BACKEND=opensearch`, `STORAGE_BACKEND=s3`
-5. Move secrets to AWS Secrets Manager
+When ready to move to GCP (full detail in `docs/production-roadmap.md` Part 3):
+1. Push Docker image to Artifact Registry
+2. Create a GCS bucket, mount it as a Cloud Run volume
+3. Deploy backend to Cloud Run, env vars pointed at the mounted paths
+   (`LOCAL_DATA_DIR`, `CHROMA_PERSIST_DIR`, `CHAT_HISTORY_DB_PATH`)
+4. Build frontend → deploy via Firebase Hosting
+5. Move secrets to Secret Manager
 
-No code changes required — only config.
+No backend swap needed — `VECTOR_STORE_BACKEND` and `STORAGE_BACKEND` stay `chromadb`/`local`.
+Only the mount path changes, not the code path.
 
 ## Persona & Tone (System Prompt)
 

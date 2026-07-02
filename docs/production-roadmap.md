@@ -1,6 +1,14 @@
 # happy-wife-gpt — Production Roadmap
 
-> Path from "works on my laptop" to "deployed on AWS with proper security."
+> Path from "works on my laptop" to "deployed on GCP with proper security."
+>
+> **Cloud choice: GCP, not AWS.** This is a personal, low-traffic practice project, so the
+> priority is genuine pay-as-you-go — not just "cheap," but $0 when nobody's using it. AWS's
+> lean estimate (~$41/month, see git history for the old AWS-flavored version of this doc)
+> is dominated by an ALB (~$18/mo) and RDS (~$15/mo), both billed flat by uptime regardless of
+> traffic. GCP's Cloud Run scales to zero and has no per-service load-balancer fee, so the
+> equivalent architecture below lands around **$0–3/month**. See "Why no managed DB / vector
+> store" in Part 3 for the specific design choice that gets us there.
 
 ---
 
@@ -14,17 +22,18 @@
 | ChromaDB (local) | ✅ Complete | `experiences` + `advice` collections, cosine HNSW |
 | X-API-Key auth | ✅ Complete | Real key generated and set in local `.env` + `frontend/.env`; enforced by default now |
 | Docker Compose | ✅ Complete | Backend + frontend, local dev |
+| Docker image (Cloud Run-ready) | ✅ Verified locally | `docker build -f backend/Dockerfile .` + `docker run --env-file .env` confirmed: `/health` → 200, `X-API-Key` auth enforced (401/200) |
 | Tests | ✅ Complete | 47 passing, fully mocked, no API keys needed |
-| OpenSearch backend | ⚠️ Stub | Three methods raise `NotImplementedError` |
-| S3 storage backend | ❌ Missing | Not implemented |
-| Persistent chat history | ✅ Complete | SQLite locally (`ChatHistoryStore`); RDS Postgres still pending for AWS (Phase D below) |
+| Managed vector search (Vertex AI) | Not planned | Skipping — ChromaDB stays local-file-based, persisted via a Cloud Run volume mount instead. See Part 3. |
+| GCS-backed file storage | Not needed as separate code | `STORAGE_BACKEND=local` keeps working as-is once `LOCAL_DATA_DIR` points at a GCS-mounted volume — no `storage/gcs.py` required for MVP |
+| Persistent chat history | ✅ Complete locally | SQLite (`ChatHistoryStore`); stays on GCS-mounted volume on Cloud Run rather than moving to a managed DB (see Part 3) |
 | IPV/abuse safety gate | ✅ Complete | Keyword + LLM classifier routes to hotline resources instead of conflict coaching, see `docs/rag-architecture.md` §2 |
 | Rate limiting | ✅ Complete | `slowapi`, `/chat` 20/min, `/ingest` 10/min, per-IP, in-memory |
 | Input length validation | ✅ Complete | `ChatRequest.message` capped at 4000 chars, min 1 |
-| Production auth | ⚠️ Partial | Real key + rate limiting done; still needs key rotation strategy for AWS (Secrets Manager) |
-| AWS infrastructure | ❌ Missing | All to be built |
+| Production auth | ⚠️ Partial | Real key + rate limiting done; still needs a rotation strategy for GCP (Secret Manager versions) |
+| GCP infrastructure | ❌ Missing | All to be built |
 | CI/CD pipeline | ❌ Missing | GitHub Actions workflows to be created |
-| Monitoring | ❌ Missing | CloudWatch, alerting |
+| Monitoring | ❌ Missing | Cloud Logging (free, automatic on Cloud Run) + Cloud Monitoring alerting to be configured |
 
 ---
 
@@ -197,7 +206,7 @@ done
 
 ---
 
-## Part 2 — Security Hardening (do before AWS)
+## Part 2 — Security Hardening (do before deploying)
 
 Complete these locally first — they cost nothing and reduce risk immediately.
 
@@ -228,14 +237,38 @@ runaway API costs.
 ### 2.4 CORS lockdown
 
 Before deploying, change `CORS_ORIGINS` in `.env` from `localhost:5173` to your production
-domain only:
+domain only (Firebase Hosting default domain or a custom domain):
 ```
-CORS_ORIGINS=["https://yourdomain.com"]
+CORS_ORIGINS=["https://your-project.web.app"]
 ```
 
 ---
 
-## Part 3 — AWS Infrastructure
+## Part 3 — GCP Infrastructure
+
+### Why no managed DB / vector store
+
+The single biggest cost lever for a personal, low-traffic project is avoiding **anything billed
+by uptime instead of usage.** Cloud SQL (GCP's RDS equivalent) and Vertex AI Vector Search are
+both fine engineering choices, but they're priced for services that actually need 24/7 uptime —
+not a project used a few times a week.
+
+Instead, this plan mounts a single GCS bucket as a **Cloud Run volume** (Cloud Storage FUSE) at
+the paths the app already writes to locally: `chroma_db/`, `data/`, and the SQLite file. Because
+`backend/storage/base.py` and `config.py` already abstract these as `local` / `chromadb`, **no
+code changes are required** — `STORAGE_BACKEND=local` and `VECTOR_STORE_BACKEND=chromadb` keep
+working unmodified, just pointed at a mounted path instead of a container-local one.
+
+**Known limitation:** GCS FUSE doesn't provide real POSIX file locks, and SQLite relies on file
+locking for writes. Set Cloud Run `max-instances=1` (fine for single-user traffic) so there's
+never true concurrent access, and treat this as a personal-project tradeoff — not something to
+carry into a multi-user deployment without revisiting.
+
+If this project ever gets real concurrent traffic, revisit with:
+- **Cloud SQL (Postgres)** for chat history (small `db-f1-micro` tier, ~$10–15/mo, not scale-to-zero)
+- **Vertex AI Vector Search** for the vector store (managed, code work behind `BaseVectorStore`, similar to filling in the current `opensearch.py` stub)
+
+Neither is needed for the "practice project, low traffic" goal.
 
 ### Architecture
 
@@ -243,123 +276,104 @@ CORS_ORIGINS=["https://yourdomain.com"]
 Internet
     │
     ▼
-CloudFront  (CDN + HTTPS via ACM)
-    ├── /*          →  S3 bucket (React frontend build)
-    └── /api/*      →  Application Load Balancer
-                            │
-                            ▼
-                    ECS Fargate  (backend Docker container)
-                        ├── AWS Secrets Manager  (API keys, DB creds)
-                        ├── RDS PostgreSQL        (chat history)
-                        ├── OpenSearch Serverless (vector store)
-                        └── S3 bucket            (uploaded documents)
+Cloud Run  (backend, HTTPS built-in, scales to zero)
+    ├── Secret Manager        (OPENAI_API_KEY, API_KEY)
+    └── GCS bucket, mounted as a volume (Cloud Storage FUSE)
+            ├── /app/chroma_db     (ChromaDB persist dir)
+            ├── /app/data          (uploaded documents)
+            └── chat_history.db    (SQLite)
+
+Firebase Hosting  (React frontend build, free tier, auto HTTPS/CDN)
 ```
 
-### Phase A — Container & ECR (1–2 hours)
+### Phase A — Container & Artifact Registry
+
+**Local build/run verified ✅** — `docker build -t happy-wife-gpt -f backend/Dockerfile .` succeeds;
+running with `--env-file .env` starts cleanly, `/health` returns 200, and `X-API-Key` auth works
+(401 without key, 200 with it). The image is cloud-agnostic — same one works on Cloud Run.
+
+Once a GCP project exists (step 6 below):
 
 ```bash
-# Create ECR repository
-aws ecr create-repository --repository-name happy-wife-gpt --region ap-southeast-1
+# Enable Artifact Registry, create a Docker repo
+gcloud services enable artifactregistry.googleapis.com run.googleapis.com secretmanager.googleapis.com
+gcloud artifacts repositories create happy-wife-gpt \
+  --repository-format=docker --location=asia-southeast1
 
 # Build and push
-aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_URI
-docker build -t happy-wife-gpt ./backend
-docker tag happy-wife-gpt:latest $ECR_URI/happy-wife-gpt:latest
-docker push $ECR_URI/happy-wife-gpt:latest
+gcloud auth configure-docker asia-southeast1-docker.pkg.dev
+docker build -t happy-wife-gpt -f backend/Dockerfile .
+docker tag happy-wife-gpt asia-southeast1-docker.pkg.dev/$PROJECT_ID/happy-wife-gpt/backend:latest
+docker push asia-southeast1-docker.pkg.dev/$PROJECT_ID/happy-wife-gpt/backend:latest
 ```
 
-Verify the container starts with env vars injected from Secrets Manager before moving on.
+### Phase B — Cloud Run backend deploy (~1 hour)
 
-### Phase B — ECS Fargate backend (~half day)
-
-1. Create ECS cluster (`happy-wife-gpt-cluster`)
-2. Task definition:
-   - CPU: 0.5 vCPU, Memory: 1 GB (sufficient for personal use)
-   - Image: ECR URI above
-   - Log driver: `awslogs` → CloudWatch log group `/ecs/happy-wife-gpt`
-   - Env vars: sourced from Secrets Manager (not hardcoded in task def)
-3. Service: 1 desired task, ALB target group, health check `GET /health`
-4. Security group: allow 8000 from ALB only; no public inbound
-
-### Phase C — OpenSearch Serverless (vector store) (~2 hours)
-
-1. Create collection (type: `vectorSearch`, name: `happy-wife-gpt`)
-2. Create data access policy allowing ECS task role
-3. Implement `backend/storage/opensearch.py`:
-   - `get_store(collection)` → `OpensearchVectorStore` (LlamaIndex adapter)
-   - `list_documents(collection)` → query `_search` with metadata filter
-   - `delete_document(doc_id, collection)` → delete by `doc_id` metadata
-4. Set env vars:
+1. Create the GCS bucket that will back persistent state:
+   ```bash
+   gcloud storage buckets create gs://happy-wife-gpt-state-$PROJECT_ID --location=asia-southeast1
    ```
-   VECTOR_STORE_BACKEND=opensearch
-   OPENSEARCH_ENDPOINT=https://xxxx.ap-southeast-1.aoss.amazonaws.com
+2. Put secrets in Secret Manager:
+   ```bash
+   echo -n "$OPENAI_API_KEY" | gcloud secrets create openai-api-key --data-file=-
+   echo -n "$API_KEY" | gcloud secrets create api-key --data-file=-
    ```
-
-> **Cost note:** OpenSearch Serverless has a ~$24/month minimum (0.5 OCU).
-> **Alternative:** Keep ChromaDB on ECS with an EFS volume (`/chroma_db` → EFS mount).
-> This saves ~$24/month and requires zero code changes — just mount the EFS in the task def.
-> Recommended for personal use until traffic justifies OpenSearch.
-
-### Phase D — RDS PostgreSQL (persistent chat history) (~2 hours)
-
-1. Create `db.t4g.micro` RDS PostgreSQL instance (20 GB gp3)
-2. VPC: same as ECS, private subnet, no public access
-3. Schema:
-   ```sql
-   CREATE TABLE chat_sessions (
-     session_id  UUID PRIMARY KEY,
-     created_at  TIMESTAMPTZ DEFAULT now()
-   );
-   CREATE TABLE chat_messages (
-     id          BIGSERIAL PRIMARY KEY,
-     session_id  UUID REFERENCES chat_sessions(session_id),
-     role        TEXT NOT NULL,   -- 'user' | 'assistant' | 'system'
-     content     TEXT NOT NULL,
-     created_at  TIMESTAMPTZ DEFAULT now()
-   );
+3. Deploy to Cloud Run with a volume mount (requires the `gen2` execution environment):
+   ```bash
+   gcloud run deploy happy-wife-gpt \
+     --image asia-southeast1-docker.pkg.dev/$PROJECT_ID/happy-wife-gpt/backend:latest \
+     --region asia-southeast1 \
+     --execution-environment gen2 \
+     --add-volume name=state,type=cloud-storage,bucket=happy-wife-gpt-state-$PROJECT_ID \
+     --add-volume-mount volume=state,mount-path=/app/state \
+     --set-secrets OPENAI_API_KEY=openai-api-key:latest,API_KEY=api-key:latest \
+     --set-env-vars LOCAL_DATA_DIR=/app/state/data,CHROMA_PERSIST_DIR=/app/state/chroma_db,CHAT_HISTORY_DB_PATH=/app/state/chat_history.db \
+     --max-instances 1 \
+     --allow-unauthenticated
    ```
-4. Implement `backend/storage/chat_history.py`:
-   - `load_history(session_id)` → returns `list[ChatMessage]`
-   - `save_turn(session_id, user_msg, assistant_msg)` → inserts two rows
-5. Wire into `RAGEngine._get_memory()` to load from DB on first call, persist after each turn
-6. Add to `.env`: `DATABASE_URL=postgresql://user:pass@host:5432/happywifegpt`
+4. Verify: `curl https://<cloud-run-url>/health`, then an authenticated call with `X-API-Key`.
 
-### Phase E — S3 file storage (~1 hour)
+> `--allow-unauthenticated` is about *Cloud Run's* IAM layer (public HTTPS access) — the app's
+> own `X-API-Key` check still gates every request underneath it, same as locally.
 
-1. Create S3 bucket: `happy-wife-gpt-documents-[account-id]`
-2. Implement `backend/storage/s3.py`:
-   - `save_upload(file_bytes, filename, collection)` → `s3.put_object(...)`
-   - Files stored at `s3://bucket/{collection}/{doc_id}/{filename}`
-3. Set env vars:
-   ```
-   STORAGE_BACKEND=s3
-   S3_BUCKET=happy-wife-gpt-documents-xxxx
-   ```
+### Phase C — Vector store: skipped by design
 
-### Phase F — Frontend: CloudFront + S3 (~1 hour)
+See "Why no managed DB / vector store" above. ChromaDB stays exactly as it is, persisted via the
+Phase B volume mount. Revisit with Vertex AI Vector Search only if traffic grows past what a
+single Cloud Run instance + GCS-mounted disk can comfortably handle.
+
+### Phase D — Chat history: skipped by design
+
+Same reasoning — SQLite on the mounted volume instead of Cloud SQL. `backend/storage/chat_history.py`
+needs no changes; only `CHAT_HISTORY_DB_PATH` moves.
+
+### Phase E — File storage: no new code needed
+
+`STORAGE_BACKEND=local` already writes to `LOCAL_DATA_DIR` — pointed at the mounted path in
+Phase B, uploaded documents land in the GCS bucket automatically. `backend/storage/gcs.py` would
+only be worth writing if you later want direct GCS API access (e.g. presigned URLs) instead of
+the FUSE mount.
+
+### Phase F — Frontend: Firebase Hosting (~30 min)
 
 ```bash
-# Build
-cd frontend && npm run build
+npm install -g firebase-tools
+firebase login
+firebase init hosting   # point public dir at frontend/dist, configure as SPA
 
-# Create S3 bucket for static hosting
-aws s3 mb s3://happy-wife-gpt-frontend --region ap-southeast-1
-
-# Upload
-aws s3 sync dist/ s3://happy-wife-gpt-frontend --delete
-
-# CloudFront distribution
-# - Origin 1: S3 bucket (/* → frontend)
-# - Origin 2: ALB (api.yourdomain.com → backend)
-# - ACM cert for yourdomain.com (request in us-east-1 for CloudFront)
-# - Route 53: yourdomain.com → CloudFront distribution
+cd frontend
+npm run build
+firebase deploy --only hosting
 ```
 
 Frontend env vars at build time:
 ```
-VITE_API_URL=https://api.yourdomain.com
-VITE_API_KEY=[production key from Secrets Manager]
+VITE_API_URL=https://<cloud-run-url>
+VITE_API_KEY=[value from Secret Manager]
 ```
+
+Firebase Hosting gives you a free `*.web.app` domain with automatic HTTPS; custom domains are
+also free (just DNS + a managed cert).
 
 ---
 
@@ -371,10 +385,11 @@ Triggers on push to `main` when files under `backend/` change.
 
 ```yaml
 steps:
-  - Run pytest tests/           # gate: must pass before build
-  - docker build backend/
-  - Push to ECR
-  - aws ecs update-service --force-new-deployment --cluster happy-wife-gpt-cluster --service happy-wife-gpt-svc
+  - Run pytest tests/                          # gate: must pass before build
+  - auth via Workload Identity Federation (google-github-actions/auth)
+  - docker build -f backend/Dockerfile .
+  - Push to Artifact Registry
+  - gcloud run deploy happy-wife-gpt --image ... --region asia-southeast1
 ```
 
 ### `.github/workflows/frontend.yml`
@@ -383,23 +398,24 @@ Triggers on push to `main` when files under `frontend/` change.
 
 ```yaml
 steps:
-  - npm ci && npm run build     # gate: must pass
-  - aws s3 sync dist/ s3://$S3_FRONTEND_BUCKET --delete
-  - aws cloudfront create-invalidation --distribution-id $CF_DIST_ID --paths "/*"
+  - npm ci && npm run build                    # gate: must pass
+  - firebase deploy --only hosting --project $FIREBASE_PROJECT_ID
 ```
 
 ### GitHub Actions secrets needed
 
 | Secret | Value |
 |---|---|
-| `AWS_ROLE_ARN` | IAM role ARN (OIDC — preferred over static keys) |
-| `ECR_REGISTRY` | `123456789.dkr.ecr.ap-southeast-1.amazonaws.com` |
-| `ECS_CLUSTER` | `happy-wife-gpt-cluster` |
-| `ECS_SERVICE` | `happy-wife-gpt-svc` |
-| `S3_FRONTEND_BUCKET` | `happy-wife-gpt-frontend` |
-| `CF_DISTRIBUTION_ID` | CloudFront distribution ID |
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | Workload Identity Federation provider resource name |
+| `GCP_SERVICE_ACCOUNT` | Deploy service account email |
+| `GCP_PROJECT_ID` | GCP project ID |
+| `GCP_REGION` | `asia-southeast1` |
+| `ARTIFACT_REGISTRY_REPO` | `happy-wife-gpt` |
+| `CLOUD_RUN_SERVICE` | `happy-wife-gpt` |
+| `FIREBASE_PROJECT_ID` | Firebase project ID |
 
-Use **OIDC federation** (not static `AWS_ACCESS_KEY_ID`) — safer, no key rotation needed.
+Use **Workload Identity Federation** (not a downloaded service-account JSON key) — same idea as
+AWS OIDC, no long-lived key to rotate or leak.
 
 ---
 
@@ -407,48 +423,45 @@ Use **OIDC federation** (not static `AWS_ACCESS_KEY_ID`) — safer, no key rotat
 
 | # | Concern | Solution | Priority |
 |---|---|---|---|
-| 1 | HTTPS everywhere | CloudFront + ACM (free certs) | 🔴 Must |
-| 2 | No secrets in code | AWS Secrets Manager for all keys | 🔴 Must |
-| 3 | DB backups | RDS automated backups, 7-day retention | 🔴 Must |
-| 4 | Cost guardrail | AWS Budget alert at $50/month → email | 🔴 Must |
+| 1 | HTTPS everywhere | Cloud Run + Firebase Hosting both auto-provision managed certs | 🔴 Must |
+| 2 | No secrets in code | Secret Manager for all keys | 🔴 Must |
+| 3 | State backups | GCS Object Versioning on the state bucket (covers ChromaDB + SQLite) | 🔴 Must |
+| 4 | Cost guardrail | GCP Budget alert at $10/month → email | 🔴 Must |
 | 5 | Rate limiting | `slowapi` in FastAPI (chat: 20/min, ingest: 10/min) | 🟠 High |
-| 6 | Logging | CloudWatch Logs via ECS awslogs driver | 🟠 High |
-| 7 | Health alerts | CloudWatch Alarm on 5xx rate → SNS → email | 🟠 High |
-| 8 | Zero-downtime deploys | ECS rolling update (built-in default) | 🟢 Built-in |
-| 9 | WAF | AWS WAF on CloudFront (rate limiting, geo) | 🟡 Medium |
-| 10 | Secret rotation | Secrets Manager auto-rotate for DB password | 🟡 Medium |
-| 11 | VPC isolation | Backend + RDS in private subnet, no public IP | 🔴 Must |
+| 6 | Logging | Cloud Logging — automatic for anything written to stdout/stderr on Cloud Run | 🟠 High |
+| 7 | Health alerts | Cloud Monitoring uptime check on `/health` → alert policy → email | 🟠 High |
+| 8 | Zero-downtime deploys | Cloud Run revisions + traffic splitting (built-in) | 🟢 Built-in |
+| 9 | WAF / abuse protection | Cloud Armor — only relevant behind an external LB; skip for a single Cloud Run service at this scale | 🟡 Low priority here |
+| 10 | Secret rotation | Secret Manager versions; manual rotation is fine at personal-project scale | 🟡 Medium |
+| 11 | Concurrency safety | `max-instances=1` (see Part 3 "Why no managed DB / vector store") | 🔴 Must, given the FUSE/SQLite tradeoff |
 
 ---
 
-## Part 6 — Cost Estimate (ap-southeast-1, personal use)
+## Part 6 — Cost Estimate (asia-southeast1, personal use)
 
-### Option A — Full AWS (OpenSearch)
-
-| Service | Spec | Est. monthly |
-|---|---|---|
-| ECS Fargate | 0.5 vCPU / 1 GB / ~8 hrs/day | ~$5 |
-| RDS PostgreSQL | db.t4g.micro, 20 GB gp3 | ~$15 |
-| OpenSearch Serverless | 0.5 OCU minimum | ~$24 |
-| S3 + CloudFront | Low traffic | <$2 |
-| Secrets Manager | 3 secrets | ~$1 |
-| ALB | 1 instance | ~$18 |
-| **Total** | | **~$65/month** |
-
-### Option B — Lean AWS (ChromaDB on EFS) — recommended to start
+### Recommended — Cloud Run + GCS-mounted ChromaDB/SQLite
 
 | Service | Spec | Est. monthly |
 |---|---|---|
-| ECS Fargate | 0.5 vCPU / 1 GB / ~8 hrs/day | ~$5 |
-| RDS PostgreSQL | db.t4g.micro, 20 GB gp3 | ~$15 |
-| EFS (ChromaDB storage) | ~1 GB | ~$0.30 |
-| S3 + CloudFront | Low traffic | <$2 |
-| Secrets Manager | 3 secrets | ~$1 |
-| ALB | 1 instance | ~$18 |
-| **Total** | | **~$41/month** |
+| Cloud Run | scales to zero, light personal traffic | ~$0 (covered by free tier) |
+| Cloud Storage | <1 GB (chroma index + docs + sqlite) | ~$0.02 |
+| Secret Manager | 2 secrets, light access | ~$0 (free tier: 6 versions, 10k accesses/mo) |
+| Firebase Hosting | low traffic | ~$0 (free tier) |
+| Cloud Logging | <50 GB/mo | ~$0 (free tier) |
+| **Total** | | **~$0–3/month** |
 
-> Start with Option B. Migrate to OpenSearch only if you need multi-instance scaling
-> (unlikely for a personal tool) or if EFS performance becomes a concern.
+### If traffic grows — add a managed DB / vector store
+
+| Service | Spec | Est. monthly |
+|---|---|---|
+| Cloud Run | as above | ~$0–5 |
+| Cloud SQL (Postgres) | `db-f1-micro`, 10 GB | ~$10–15 |
+| Vertex AI Vector Search | smallest tier | ~$20+ |
+| Cloud Storage + Firebase Hosting | as above | ~$0–2 |
+| **Total** | | **~$30–40/month** |
+
+Start with the recommended option. There is no realistic scenario for a personal, low-traffic
+practice project where the second table is worth it.
 
 ---
 
@@ -459,14 +472,14 @@ Use **OIDC federation** (not static `AWS_ACCESS_KEY_ID`) — safer, no key rotat
 [x] 2. Generate and set a real API_KEY in .env
 [x] 3. Add rate limiting (slowapi)
 [x] 4. Add input length validation to ChatRequest
-[x] 5. Implement persistent chat history (SQLite first, then RDS)
-[ ] 6. Set up AWS account + billing alerts
-[ ] 7. Phase A — ECR + test container locally
-[ ] 8. Phase B — ECS Fargate backend
-[ ] 9. Phase D — RDS PostgreSQL (chat history)
-[ ] 10. Phase E — S3 file storage
-[ ] 11. Phase F — CloudFront + frontend deploy
-[ ] 12. GitHub Actions CI/CD
-[ ] 13. CloudWatch logging + alerts
-[ ] 14. Phase C — OpenSearch (optional, defer until needed)
+[x] 5. Implement persistent chat history (SQLite)
+[x] 6. Phase A (local half) — build + verify the Docker image locally
+[ ] 7. Create a GCP project, enable billing, set a budget alert
+[ ] 8. Phase A (remote half) — Artifact Registry push
+[ ] 9. Phase B — Cloud Run deploy with GCS-mounted volume + Secret Manager
+[ ] 10. Phase F — Firebase Hosting frontend deploy
+[ ] 11. GitHub Actions CI/CD (Workload Identity Federation)
+[ ] 12. Cloud Monitoring uptime check + alert policy
+[ ] 13. (optional, defer) Cloud SQL Postgres — only if you outgrow SQLite-on-GCS
+[ ] 14. (optional, defer) Vertex AI Vector Search — only if you outgrow ChromaDB-on-GCS
 ```
