@@ -22,18 +22,18 @@
 | ChromaDB (local) | ✅ Complete | `experiences` + `advice` collections, cosine HNSW |
 | X-API-Key auth | ✅ Complete | Real key generated and set in local `.env` + `frontend/.env`; enforced by default now |
 | Docker Compose | ✅ Complete | Backend + frontend, local dev |
-| Docker image (Cloud Run-ready) | ✅ Verified locally | `docker build -f backend/Dockerfile .` + `docker run --env-file .env` confirmed: `/health` → 200, `X-API-Key` auth enforced (401/200) |
+| Docker image (Cloud Run-ready) | ✅ Deployed | Rebuilt for `linux/amd64` via `docker buildx`, pushed to Artifact Registry, running on Cloud Run |
 | Tests | ✅ Complete | 47 passing, fully mocked, no API keys needed |
 | Managed vector search (Vertex AI) | Not planned | Skipping — ChromaDB stays local-file-based, persisted via a Cloud Run volume mount instead. See Part 3. |
-| GCS-backed file storage | Not needed as separate code | `STORAGE_BACKEND=local` keeps working as-is once `LOCAL_DATA_DIR` points at a GCS-mounted volume — no `storage/gcs.py` required for MVP |
-| Persistent chat history | ✅ Complete locally | SQLite (`ChatHistoryStore`); stays on GCS-mounted volume on Cloud Run rather than moving to a managed DB (see Part 3) |
+| GCS-backed file storage | ✅ Deployed | `STORAGE_BACKEND=local` unchanged, `LOCAL_DATA_DIR` points at the GCS-mounted volume — no `storage/gcs.py` needed |
+| Persistent chat history | ✅ Deployed | SQLite (`ChatHistoryStore`) on the GCS-mounted volume on Cloud Run; persistence verified across a forced revision change |
 | IPV/abuse safety gate | ✅ Complete | Keyword + LLM classifier routes to hotline resources instead of conflict coaching, see `docs/rag-architecture.md` §2 |
 | Rate limiting | ✅ Complete | `slowapi`, `/chat` 20/min, `/ingest` 10/min, per-IP, in-memory |
 | Input length validation | ✅ Complete | `ChatRequest.message` capped at 4000 chars, min 1 |
 | Production auth | ⚠️ Partial | Real key + rate limiting done; still needs a rotation strategy for GCP (Secret Manager versions) |
-| GCP infrastructure | ❌ Missing | All to be built |
-| CI/CD pipeline | ❌ Missing | GitHub Actions workflows to be created |
-| Monitoring | ❌ Missing | Cloud Logging (free, automatic on Cloud Run) + Cloud Monitoring alerting to be configured |
+| GCP infrastructure | ✅ Deployed | Cloud Run + Firebase Hosting live, see "Deployed ✅" in Part 3 |
+| CI/CD pipeline | ❌ Missing | GitHub Actions workflows — deliberately deferred until the manual deploy proves stable |
+| Monitoring | ✅ Deployed | Cloud Logging automatic on Cloud Run; uptime check on `/health` + email alert policy configured |
 
 ---
 
@@ -234,13 +234,11 @@ runaway API costs.
 
 `ChatRequest.message` in `backend/models/schemas.py` now has `min_length=1, max_length=4000`.
 
-### 2.4 CORS lockdown
+### 2.4 CORS lockdown ✅ Done
 
-Before deploying, change `CORS_ORIGINS` in `.env` from `localhost:5173` to your production
-domain only (Firebase Hosting default domain or a custom domain):
-```
-CORS_ORIGINS=["https://your-project.web.app"]
-```
+Cloud Run's `CORS_ORIGINS` env var is set to `["https://happy-wife-gpt-abbca5.web.app"]` —
+verified via `OPTIONS` preflight: the Firebase Hosting origin gets `access-control-allow-origin`
+back, an arbitrary origin gets rejected with 400. Local `.env` still uses `localhost:5173` for dev.
 
 ---
 
@@ -286,6 +284,45 @@ Cloud Run  (backend, HTTPS built-in, scales to zero)
 Firebase Hosting  (React frontend build, free tier, auto HTTPS/CDN)
 ```
 
+### Deployed ✅
+
+| Resource | Value |
+|---|---|
+| GCP project | `happy-wife-gpt-abbca5` (region `us-east1`) |
+| Cloud Run backend | https://happy-wife-gpt-672364054992.us-east1.run.app |
+| Firebase Hosting frontend | https://happy-wife-gpt-abbca5.web.app |
+| GCS state bucket | `gs://happy-wife-gpt-state-happy-wife-gpt-abbca5` (mounted at `/app/state`) |
+| Budget alert | $10/month, 50/90/100% thresholds, email to billing admins |
+| Uptime check + alert | `happy-wife-gpt-health` against `/health`, email notification channel |
+
+**Persistence verified**: ingested a test doc, forced a new Cloud Run revision (no-op env var
+bump), confirmed the doc was still listed via `/documents` afterward — the GCS-FUSE-mounted
+ChromaDB/SQLite design holds up across instance churn.
+
+**Gotchas hit during the real deploy, in case this is repeated:**
+- `brew install --cask google-cloud-sdk` failed on a `virtualenv: command not found` error even
+  after installing `virtualenv` via Homebrew — the cask's postinstall script runs with a
+  stripped PATH. Fixed by installing the SDK from Google's official tarball instead
+  (`https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-darwin-arm.tar.gz`),
+  which doesn't go through Homebrew's sandboxed installer.
+- The locally-built Docker image was `arm64` (Apple Silicon) — Cloud Run requires
+  `linux/amd64`. Rebuild with `docker buildx build --platform linux/amd64 ... --push` (and make
+  sure `$HOME/google-cloud-sdk/bin` is on `PATH` so `docker-credential-gcloud` resolves).
+- Cloud Run's default compute service account needs
+  `roles/secretmanager.secretAccessor` explicitly granted on each secret
+  (`gcloud secrets add-iam-policy-binding ... --role=roles/secretmanager.secretAccessor`) —
+  referencing a secret in `--set-secrets` isn't enough on its own.
+- The backend Dockerfile's `CMD` listens on port 8000, but Cloud Run defaults to expecting
+  8080. Pass `--port 8000` to `gcloud run deploy` (or change the Dockerfile) or the revision
+  fails to become ready.
+- `firebase login` run through a non-interactive `!`-prefixed shell fails with "Cannot run
+  login in non-interactive mode" — needs a real terminal (Terminal.app/iTerm) with a TTY.
+- Linking Firebase to an existing GCP project doesn't require the console at all:
+  `firebase projects:addfirebase <PROJECT_ID>` does it in one command.
+- `gcloud alpha`/`gcloud beta` command groups aren't installed by default — needed for
+  `gcloud beta monitoring channels create` and `gcloud alpha monitoring policies create`.
+  `gcloud components install alpha beta --quiet` pulls them in non-interactively.
+
 ### Phase A — Container & Artifact Registry
 
 **Local build/run verified ✅** — `docker build -t happy-wife-gpt -f backend/Dockerfile .` succeeds;
@@ -298,20 +335,20 @@ Once a GCP project exists (step 6 below):
 # Enable Artifact Registry, create a Docker repo
 gcloud services enable artifactregistry.googleapis.com run.googleapis.com secretmanager.googleapis.com
 gcloud artifacts repositories create happy-wife-gpt \
-  --repository-format=docker --location=asia-southeast1
+  --repository-format=docker --location=us-east1
 
 # Build and push
-gcloud auth configure-docker asia-southeast1-docker.pkg.dev
+gcloud auth configure-docker us-east1-docker.pkg.dev
 docker build -t happy-wife-gpt -f backend/Dockerfile .
-docker tag happy-wife-gpt asia-southeast1-docker.pkg.dev/$PROJECT_ID/happy-wife-gpt/backend:latest
-docker push asia-southeast1-docker.pkg.dev/$PROJECT_ID/happy-wife-gpt/backend:latest
+docker tag happy-wife-gpt us-east1-docker.pkg.dev/$PROJECT_ID/happy-wife-gpt/backend:latest
+docker push us-east1-docker.pkg.dev/$PROJECT_ID/happy-wife-gpt/backend:latest
 ```
 
 ### Phase B — Cloud Run backend deploy (~1 hour)
 
 1. Create the GCS bucket that will back persistent state:
    ```bash
-   gcloud storage buckets create gs://happy-wife-gpt-state-$PROJECT_ID --location=asia-southeast1
+   gcloud storage buckets create gs://happy-wife-gpt-state-$PROJECT_ID --location=us-east1
    ```
 2. Put secrets in Secret Manager:
    ```bash
@@ -321,8 +358,8 @@ docker push asia-southeast1-docker.pkg.dev/$PROJECT_ID/happy-wife-gpt/backend:la
 3. Deploy to Cloud Run with a volume mount (requires the `gen2` execution environment):
    ```bash
    gcloud run deploy happy-wife-gpt \
-     --image asia-southeast1-docker.pkg.dev/$PROJECT_ID/happy-wife-gpt/backend:latest \
-     --region asia-southeast1 \
+     --image us-east1-docker.pkg.dev/$PROJECT_ID/happy-wife-gpt/backend:latest \
+     --region us-east1 \
      --execution-environment gen2 \
      --add-volume name=state,type=cloud-storage,bucket=happy-wife-gpt-state-$PROJECT_ID \
      --add-volume-mount volume=state,mount-path=/app/state \
@@ -389,7 +426,7 @@ steps:
   - auth via Workload Identity Federation (google-github-actions/auth)
   - docker build -f backend/Dockerfile .
   - Push to Artifact Registry
-  - gcloud run deploy happy-wife-gpt --image ... --region asia-southeast1
+  - gcloud run deploy happy-wife-gpt --image ... --region us-east1
 ```
 
 ### `.github/workflows/frontend.yml`
@@ -409,7 +446,7 @@ steps:
 | `GCP_WORKLOAD_IDENTITY_PROVIDER` | Workload Identity Federation provider resource name |
 | `GCP_SERVICE_ACCOUNT` | Deploy service account email |
 | `GCP_PROJECT_ID` | GCP project ID |
-| `GCP_REGION` | `asia-southeast1` |
+| `GCP_REGION` | `us-east1` |
 | `ARTIFACT_REGISTRY_REPO` | `happy-wife-gpt` |
 | `CLOUD_RUN_SERVICE` | `happy-wife-gpt` |
 | `FIREBASE_PROJECT_ID` | Firebase project ID |
@@ -437,7 +474,7 @@ AWS OIDC, no long-lived key to rotate or leak.
 
 ---
 
-## Part 6 — Cost Estimate (asia-southeast1, personal use)
+## Part 6 — Cost Estimate (us-east1, personal use)
 
 ### Recommended — Cloud Run + GCS-mounted ChromaDB/SQLite
 
@@ -474,12 +511,17 @@ practice project where the second table is worth it.
 [x] 4. Add input length validation to ChatRequest
 [x] 5. Implement persistent chat history (SQLite)
 [x] 6. Phase A (local half) — build + verify the Docker image locally
-[ ] 7. Create a GCP project, enable billing, set a budget alert
-[ ] 8. Phase A (remote half) — Artifact Registry push
-[ ] 9. Phase B — Cloud Run deploy with GCS-mounted volume + Secret Manager
-[ ] 10. Phase F — Firebase Hosting frontend deploy
-[ ] 11. GitHub Actions CI/CD (Workload Identity Federation)
-[ ] 12. Cloud Monitoring uptime check + alert policy
+[x] 7. Create a GCP project, enable billing, set a budget alert
+[x] 8. Phase A (remote half) — Artifact Registry push
+[x] 9. Phase B — Cloud Run deploy with GCS-mounted volume + Secret Manager
+[x] 10. Phase F — Firebase Hosting frontend deploy
+[ ] 11. GitHub Actions CI/CD (Workload Identity Federation)  ← deliberately deferred, see below
+[x] 12. Cloud Monitoring uptime check + alert policy
 [ ] 13. (optional, defer) Cloud SQL Postgres — only if you outgrow SQLite-on-GCS
 [ ] 14. (optional, defer) Vertex AI Vector Search — only if you outgrow ChromaDB-on-GCS
 ```
+
+Steps 7–10 and 12 are live — see "Deployed ✅" in Part 3 for URLs and the gotchas hit along the
+way. Step 11 (GitHub Actions CI/CD) was scoped out of the first pass on purpose: get the manual
+deploy proven first, automate it once it's clear the design (GCS-mounted state, `max-instances=1`)
+holds up in practice.
