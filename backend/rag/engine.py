@@ -171,14 +171,16 @@ class RAGEngine:
             self._history.save_turn(session_id, message, answer)
             return {"answer": answer, "sources": []}
 
-        self._history.save_turn(session_id, message, answer)
-        return {"answer": answer, "sources": self._extract_sources(response)}
+        sources = self._extract_sources(response)
+        self._history.save_turn(session_id, message, answer, sources=sources)
+        return {"answer": answer, "sources": sources}
 
     async def chat_stream(
         self,
         session_id: str,
         message: str,
         collection: Literal["experiences", "advice", "both"] = "both",
+        sources_out: list[dict] | None = None,
     ) -> AsyncGenerator[str, None]:
         flagged, is_new_flag = await self._check_safety(session_id, message)
         if flagged:
@@ -225,4 +227,7 @@ class RAGEngine:
             async for token in streaming_response.async_response_gen():
                 full_text += token
                 yield token
-            self._history.save_turn(session_id, message, full_text)
+            sources = self._extract_sources(streaming_response)
+            if sources_out is not None:
+                sources_out.extend(sources)
+            self._history.save_turn(session_id, message, full_text, sources=sources)

@@ -2,6 +2,15 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+# --- Shared ---
+
+class SourceChunk(BaseModel):
+    text: str
+    score: float
+    source: str
+    collection: str
+
+
 # --- Sessions ---
 
 class SessionResponse(BaseModel):
@@ -12,6 +21,7 @@ class ChatHistoryMessage(BaseModel):
     role: str
     content: str
     created_at: str
+    sources: list[SourceChunk] = []
 
 
 class SessionHistoryResponse(BaseModel):
@@ -47,13 +57,6 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
     collection: Literal["experiences", "advice", "both"] = "both"
     stream: bool = True
-
-
-class SourceChunk(BaseModel):
-    text: str
-    score: float
-    source: str
-    collection: str
 
 
 class ChatResponse(BaseModel):

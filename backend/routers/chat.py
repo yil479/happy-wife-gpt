@@ -11,8 +11,11 @@ router = APIRouter(tags=["chat"], dependencies=[Depends(require_api_key)])
 
 
 async def _sse_generator(session_id: str, message: str, collection: str, engine):
-    async for token in engine.chat_stream(session_id, message, collection):
+    sources: list[dict] = []
+    async for token in engine.chat_stream(session_id, message, collection, sources_out=sources):
         yield f"data: {json.dumps({'token': token})}\n\n"
+    if sources:
+        yield f"data: {json.dumps({'sources': sources})}\n\n"
     yield "data: [DONE]\n\n"
 
 

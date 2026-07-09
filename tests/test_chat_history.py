@@ -25,6 +25,27 @@ def test_save_turn_persists_both_messages_in_order(store):
     assert history[1]["content"] == "Take a deep breath."
 
 
+def test_save_turn_persists_sources_for_assistant_only(store):
+    store.create_session("s1")
+    store.save_turn(
+        "s1", "hello", "hi there",
+        sources=[{"text": "x", "score": 0.5, "source": "a.md", "collection": "advice"}],
+    )
+
+    history = store.load_history("s1")
+    assert history[0]["sources"] == []
+    assert history[1]["sources"] == [{"text": "x", "score": 0.5, "source": "a.md", "collection": "advice"}]
+
+
+def test_save_turn_defaults_to_empty_sources(store):
+    store.create_session("s1")
+    store.save_turn("s1", "hello", "hi there")
+
+    history = store.load_history("s1")
+    assert history[0]["sources"] == []
+    assert history[1]["sources"] == []
+
+
 def test_save_turn_appends_across_multiple_turns(store):
     store.create_session("s1")
     store.save_turn("s1", "first", "first reply")
@@ -58,3 +79,18 @@ def test_get_history_returns_persisted_messages(client, history_store):
     messages = resp.json()["messages"]
     assert [m["role"] for m in messages] == ["user", "assistant"]
     assert [m["content"] for m in messages] == ["hello", "hi there"]
+    assert messages[0]["sources"] == []
+    assert messages[1]["sources"] == []
+
+
+def test_get_history_includes_persisted_sources(client, history_store):
+    session_id = client.post("/sessions", headers=AUTH_HEADERS).json()["session_id"]
+    history_store.save_turn(
+        session_id, "hello", "hi there",
+        sources=[{"text": "x", "score": 0.5, "source": "a.md", "collection": "advice"}],
+    )
+
+    resp = client.get(f"/sessions/{session_id}/history", headers=AUTH_HEADERS)
+    assert resp.status_code == 200
+    messages = resp.json()["messages"]
+    assert messages[1]["sources"] == [{"text": "x", "score": 0.5, "source": "a.md", "collection": "advice"}]

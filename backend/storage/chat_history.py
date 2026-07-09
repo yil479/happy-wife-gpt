@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
@@ -38,6 +39,12 @@ class ChatHistoryStore:
                     created_at TEXT NOT NULL
                 )"""
             )
+            # Migrate DBs created before sources_json existed.
+            msg_cols = {row[1] for row in conn.execute("PRAGMA table_info(chat_messages)")}
+            if "sources_json" not in msg_cols:
+                conn.execute(
+                    "ALTER TABLE chat_messages ADD COLUMN sources_json TEXT NOT NULL DEFAULT '[]'"
+                )
             conn.commit()
 
     def create_session(self, session_id: str) -> None:
@@ -49,16 +56,24 @@ class ChatHistoryStore:
             )
             conn.commit()
 
-    def save_turn(self, session_id: str, user_msg: str, assistant_msg: str) -> None:
+    def save_turn(
+        self,
+        session_id: str,
+        user_msg: str,
+        assistant_msg: str,
+        sources: list[dict] | None = None,
+    ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with closing(self._connect()) as conn:
             conn.execute(
-                "INSERT INTO chat_messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-                (session_id, "user", user_msg, now),
+                "INSERT INTO chat_messages (session_id, role, content, created_at, sources_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, "user", user_msg, now, "[]"),
             )
             conn.execute(
-                "INSERT INTO chat_messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-                (session_id, "assistant", assistant_msg, now),
+                "INSERT INTO chat_messages (session_id, role, content, created_at, sources_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, "assistant", assistant_msg, now, json.dumps(sources or [])),
             )
             conn.commit()
 
@@ -81,11 +96,16 @@ class ChatHistoryStore:
     def load_history(self, session_id: str) -> list[dict]:
         with closing(self._connect()) as conn:
             cursor = conn.execute(
-                "SELECT role, content, created_at FROM chat_messages "
+                "SELECT role, content, created_at, sources_json FROM chat_messages "
                 "WHERE session_id = ? ORDER BY id ASC",
                 (session_id,),
             )
             return [
-                {"role": role, "content": content, "created_at": created_at}
-                for role, content, created_at in cursor.fetchall()
+                {
+                    "role": role,
+                    "content": content,
+                    "created_at": created_at,
+                    "sources": json.loads(sources_json) if sources_json else [],
+                }
+                for role, content, created_at, sources_json in cursor.fetchall()
             ]

@@ -26,6 +26,7 @@ export interface ChatHistoryMessage {
   role: string
   content: string
   created_at: string
+  sources?: SourceChunk[]
 }
 
 export interface SessionHistoryResponse {
@@ -111,9 +112,7 @@ export async function streamChat(
   const reader = res.body!.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
-  // Sources are not returned in streaming mode; collect from final non-stream call if needed.
-  // For now return empty — sources are shown only in non-streaming path.
-  const sources: SourceChunk[] = []
+  let sources: SourceChunk[] = []
 
   while (true) {
     const { done, value } = await reader.read()
@@ -126,8 +125,12 @@ export async function streamChat(
       const data = line.slice(6).trim()
       if (data === '[DONE]') return sources
       try {
-        const parsed = JSON.parse(data) as { token: string }
-        onToken(parsed.token)
+        const parsed = JSON.parse(data) as { token?: string; sources?: SourceChunk[] }
+        if (parsed.sources) {
+          sources = parsed.sources
+        } else if (typeof parsed.token === 'string') {
+          onToken(parsed.token)
+        }
       } catch { /* ignore malformed lines */ }
     }
   }

@@ -224,7 +224,7 @@ flowchart TD
     C --> D[gpt-4o-mini]
 
     D --> E{stream param}
-    E -->|true — default| F["SSE stream\ndata: {token: '...'}\n\ndata: [DONE]"]
+    E -->|true — default| F["SSE stream\ndata: {token: '...'} × N\n\ndata: {sources: [...]} — if any\n\ndata: [DONE]"]
     E -->|false| G["JSON response\n{session_id, answer, sources[]}"]
 
     F --> H([Browser / client])
@@ -267,8 +267,14 @@ data: {"token": " sounds"}
 
 data: {"token": " like"}
 ...
+data: {"sources": [{"text": "...", "score": 0.87, "source": "gottman-repair-attempts.md", "collection": "advice"}, ...]}
+
 data: [DONE]
 ```
+
+The `sources` event is only sent when the RAG path actually retrieved nodes — the safety-flagged
+and empty-knowledge-base fallback paths (§3, §4) never emit one, since there's nothing to cite.
+See §9 for how citations flow end-to-end.
 
 The frontend reads this via `fetch` + `ReadableStream` (not `EventSource`, which only supports GET).
 
@@ -414,7 +420,56 @@ When `collection=both` (default in chat), both indexes are searched in parallel 
 
 ---
 
-## 9. Honest Gaps (not yet implemented)
+## 9. Citations / Source Attribution
+
+Each AI answer can show a collapsible "▸ N sources" toggle underneath it — filename, collection
+badge, similarity score, and text snippet per retrieved chunk — so the user can verify what the
+counselor actually drew from, without it cluttering the main reply.
+
+**Why this only required backend plumbing, not new UI:** `MessageBubble.tsx` and the
+`Message`/`SourceChunk` types already existed with this exact toggle built in. The non-streaming
+`POST /chat` path (`stream:false`) already returned `sources` via `RAGEngine._extract_sources()`.
+The gap was specifically the streaming path (the app's default and only path the frontend
+actually calls): `chat_stream()` never captured `source_nodes` off the streaming response, and the
+SSE parser only understood `{"token": ...}` events.
+
+```mermaid
+flowchart TD
+    A[streaming_response.async_response_gen exhausted] --> B[_extract_sources streaming_response]
+    B --> C{sources_out param<br/>passed by caller?}
+    C -->|yes| D[sources_out.extend sources]
+    C -->|no| E[discarded — non-streaming chat callers don't need it]
+    D --> F[_sse_generator yields<br/>data: sources: ... before DONE]
+    D --> G[save_turn persists<br/>sources_json alongside the turn]
+    F --> H[client.ts streamChat captures<br/>the sources event, returns it]
+    H --> I[useChat.ts attaches sources<br/>to the assistant Message]
+    I --> J[MessageBubble renders<br/>the existing toggle]
+```
+
+### Design notes
+
+- **Output-parameter, not a new yield type.** `chat_stream()` gained an optional
+  `sources_out: list[dict] | None` param instead of restructuring its
+  `AsyncGenerator[str, None]` contract — there are 4 distinct yield sites (two safety-flagged
+  paths, the empty-KB fallback, and the real RAG path), and only the RAG path ever has sources.
+  The caller (`_sse_generator` in `routers/chat.py`) allocates a list, passes it in, and reads it
+  back once the token loop finishes.
+- **Same extraction logic as non-streaming.** Both paths call the existing
+  `RAGEngine._extract_sources()` helper against their respective response objects
+  (`achat()`'s return value vs. `astream_chat()`'s `streaming_response`), so citations look
+  identical whether or not the request streamed.
+- **Persisted, not just live state.** `chat_messages` gained a `sources_json TEXT` column
+  (migrated in place via the same `PRAGMA table_info` + `ALTER TABLE` pattern already used for
+  `safety_flagged`), populated by `save_turn(..., sources=...)` and returned by `load_history()`.
+  Reloading the page or revisiting an old session restores citations, not just the message text.
+- **No dedup, no ranking changes.** Citations are exactly the `source_nodes` the chat engine used
+  to generate that specific answer — same chunks that could repeat the same source file multiple
+  times if several of its chunks were retrieved. This matches the pre-existing non-streaming
+  behavior; not a new design decision.
+
+---
+
+## 10. Honest Gaps (not yet implemented)
 
 | Gap | Where it would go | Notes |
 |---|---|---|

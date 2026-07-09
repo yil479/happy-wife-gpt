@@ -54,6 +54,7 @@ export function useChat(): UseChatReturn {
           id: crypto.randomUUID(),
           role: m.role === 'assistant' ? 'assistant' : 'user',
           content: m.content,
+          sources: m.sources,
         })))
       })
       .catch(() => beginFreshSession())
@@ -81,7 +82,7 @@ export function useChat(): UseChatReturn {
     setError(null)
 
     try {
-      await streamChat(
+      const sources = await streamChat(
         { session_id: sessionIdRef.current, message: text, collection },
         (token) => {
           setMessages((prev) =>
@@ -89,6 +90,11 @@ export function useChat(): UseChatReturn {
           )
         },
       )
+      if (sources.length > 0) {
+        setMessages((prev) =>
+          prev.map((m) => m.id === assistantId ? { ...m, sources } : m),
+        )
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Something went wrong'
       setError(msg)

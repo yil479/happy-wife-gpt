@@ -35,6 +35,21 @@ def test_chat_non_streaming(client):
     assert data["sources"][0]["score"] == 0.9
 
 
+def test_chat_streaming_includes_sources_before_done(client):
+    session_id = client.post("/sessions", headers=AUTH_HEADERS).json()["session_id"]
+
+    resp = client.post(
+        "/chat",
+        headers=AUTH_HEADERS,
+        json={"session_id": session_id, "message": "I feel frustrated.", "stream": True},
+    )
+    assert resp.status_code == 200
+    body = resp.text
+    assert '"token"' in body
+    assert '"source": "book.pdf"' in body
+    assert body.index('"sources"') < body.index("[DONE]")
+
+
 def test_chat_no_auth(client):
     resp = client.post(
         "/chat",

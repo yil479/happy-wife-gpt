@@ -32,6 +32,16 @@ def mock_engine():
             {"text": "some advice", "score": 0.9, "source": "book.pdf", "collection": "advice"}
         ],
     })
+
+    async def _chat_stream(session_id, message, collection, sources_out=None):
+        for token in ["Take ", "a ", "deep ", "breath."]:
+            yield token
+        if sources_out is not None:
+            sources_out.append(
+                {"text": "some advice", "score": 0.9, "source": "book.pdf", "collection": "advice"}
+            )
+
+    engine.chat_stream = _chat_stream
     return engine
 
 
